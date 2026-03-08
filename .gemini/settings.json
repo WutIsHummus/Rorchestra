@@ -1,0 +1,60 @@
+{
+    "general": {
+        "defaultApprovalMode": "plan",
+        "plan": {
+            "modelRouting": true
+        }
+    },
+    "model": {
+        "maxSessionTurns": 10,
+        "compressionThreshold": 0.3
+    },
+    "context": {
+        "fileFiltering": {
+            "respectGitIgnore": true,
+            "respectGeminiIgnore": true
+        }
+    },
+    "tools": {
+        "useRipgrep": true,
+        "disableLLMCorrection": true
+    },
+    "security": {
+        "disableYoloMode": true,
+        "environmentVariableRedaction": {
+            "enabled": true
+        }
+    },
+    "experimental": {
+        "enableAgents": true,
+        "plan": true,
+        "jitContext": true
+    },
+    "skills": {
+        "enabled": true
+    },
+    "hooksConfig": {
+        "enabled": true
+    },
+    "mcpServers": {
+        "Roblox_Studio": {
+            "command": "C:\\Tools\\rbx-studio-mcp\\rbx-studio-mcp.exe",
+            "args": [
+                "--stdio"
+            ]
+        },
+        "robloxstudio-mcp": {
+            "command": "node",
+            "args": [
+                "D:\\SPTS\\robloxstudio-mcp\\packages\\robloxstudio-mcp\\dist\\index.js"
+            ]
+        },
+        "roblox_docs": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-roblox-docs"
+            ]
+        }
+    }
+}

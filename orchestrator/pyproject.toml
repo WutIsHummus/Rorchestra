@@ -1,0 +1,32 @@
+[project]
+name = "orchestrator"
+version = "0.1.0"
+description = "Roblox/Luau AI orchestration system for codebase understanding and scoped edit generation"
+requires-python = ">=3.11"
+dependencies = [
+    "typer[all]>=0.9.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "sqlalchemy>=2.0",
+    "alembic>=1.12",
+    "tiktoken>=0.5",
+    "aiofiles>=23.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+orch = "app.main:cli"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
