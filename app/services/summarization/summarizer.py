@@ -16,7 +16,7 @@ from app.storage.database import get_session
 
 
 _SCRIPT_SUMMARY_PROMPT = """\
-You are a Luau/Roblox code analyst.  Summarise the following script in ≤5 bullet points.
+You are a Luau/Roblox code analyst.  Summarise the following script in <=5 bullet points.
 Focus on:  purpose, exported API surface, key dependencies, runtime side (server/client/shared),
 and any cross-cutting contracts (remotes, shared config, UI bindings).
 
@@ -33,7 +33,7 @@ Return ONLY the bullet-point summary, no preamble.
 
 _DOMAIN_SUMMARY_PROMPT = """\
 You are a Roblox game architecture analyst.  Summarise the following domain
-(logical grouping of scripts on the {kind} side) in ≤8 bullet points.
+(logical grouping of scripts on the {kind} side) in <=8 bullet points.
 Focus on: key modules, public APIs, internal patterns, invariants, risks.
 
 Domain: {name}
@@ -87,6 +87,47 @@ def summarise_script(
         return summary
     finally:
         session.close()
+
+
+def summarise_scripts_parallel(
+    script_ids: list[int],
+    repo_root: str | Path,
+    max_workers: int = 4,
+    on_complete: callable | None = None,
+) -> dict[int, str]:
+    """
+    Summarise multiple scripts in parallel using a thread pool.
+
+    Args:
+        script_ids: List of script IDs to summarise.
+        repo_root: Repository root path.
+        max_workers: Max concurrent Gemini CLI calls.
+        on_complete: Optional callback(script_id, summary, error) called
+                     after each script finishes.
+
+    Returns:
+        Dict mapping script_id -> summary (or error message).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results: dict[int, str] = {}
+
+    def _do_one(sid: int) -> tuple[int, str, str | None]:
+        try:
+            summary = summarise_script(sid, repo_root)
+            return sid, summary, None
+        except Exception as exc:
+            return sid, "", str(exc)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_do_one, sid): sid for sid in script_ids}
+        for future in as_completed(futures):
+            sid, summary, error = future.result()
+            results[sid] = summary if not error else f"(error: {error})"
+            if on_complete:
+                on_complete(sid, summary, error)
+
+    return results
 
 
 def summarise_domain(domain_id: int, repo_root: str | Path) -> str:

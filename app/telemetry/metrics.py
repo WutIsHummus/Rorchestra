@@ -61,3 +61,41 @@ def record_mcp_call(capability: str, status: str) -> None:
 
 def record_validation(task_id: int, status: str, source: str) -> None:
     emit("validation", {"task_id": task_id, "status": status, "source": source})
+
+
+def record_phase(
+    task_id: int,
+    phase: str,
+    elapsed_secs: float,
+    tokens_used: int = 0,
+    scripts_examined: int = 0,
+    error: str | None = None,
+) -> None:
+    """Record per-phase timing and resource usage during investigation."""
+    emit("investigation_phase", {
+        "task_id": task_id,
+        "phase": phase,
+        "elapsed_secs": round(elapsed_secs, 2),
+        "tokens_used": tokens_used,
+        "scripts_examined": scripts_examined,
+        "error": error,
+    })
+
+
+def record_investigation(
+    task_id: int,
+    total_elapsed_secs: float,
+    phases_completed: int,
+    phases_failed: int,
+    scripts_found: int,
+    invariants_found: int,
+) -> None:
+    """Record overall investigation summary metrics."""
+    emit("investigation_complete", {
+        "task_id": task_id,
+        "total_elapsed_secs": round(total_elapsed_secs, 2),
+        "phases_completed": phases_completed,
+        "phases_failed": phases_failed,
+        "scripts_found": scripts_found,
+        "invariants_found": invariants_found,
+    })

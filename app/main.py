@@ -66,6 +66,38 @@ def ingest(
     )
     record_ingest(snapshot.repo_id, snapshot.script_count, delta.added_edges)
 
+    # Auto-load skills into memory
+    from app.services.memory.skill_loader import load_all_skills
+    loaded = load_all_skills()
+    if loaded:
+        console.print(f"  Skills loaded: {len(loaded)}")
+        for sk in loaded:
+            console.print(f"    • {sk['name']}")
+
+
+# ── load-skills ───────────────────────────────────────────────────────────
+
+
+@cli.command(name="load-skills")
+def load_skills():
+    """Load or reload skill files from the skills directory into procedural memory."""
+    from app.services.memory.skill_loader import load_all_skills
+
+    loaded = load_all_skills()
+    if not loaded:
+        console.print("[dim]No skill files found in skills/ directory.[/dim]")
+        return
+
+    console.print(f"[bold green]Loaded {len(loaded)} skill(s):[/bold green]")
+    for sk in loaded:
+        triggers = sk.get('triggers', {})
+        sides = triggers.get('runtime_sides', ['all'])
+        keywords = triggers.get('scope_keywords', [])
+        console.print(f"  • [cyan]{sk['name']}[/cyan]")
+        console.print(f"    Sides: {', '.join(sides)}")
+        if keywords:
+            console.print(f"    Keywords: {', '.join(keywords[:8])}{'…' if len(keywords) > 8 else ''}")
+
 
 # ── summarize ─────────────────────────────────────────────────────────────
 
@@ -74,12 +106,17 @@ def ingest(
 def summarize(
     repo_id: int = typer.Option(..., "--repo-id", "-r", help="Repository ID to summarise"),
     domain_only: bool = typer.Option(False, "--domain-only", help="Only summarise domains, skip scripts"),
+    workers: int = typer.Option(4, "--workers", "-w", help="Max parallel Gemini CLI workers (1=sequential)"),
 ):
     """Generate semantic memory summaries for scripts and domains."""
     from sqlalchemy import select
     from app.models.entities import Domain, Script, Repository
-    from app.services.summarization.summarizer import summarise_domain, summarise_script
+    from app.services.summarization.summarizer import (
+        summarise_domain,
+        summarise_scripts_parallel,
+    )
     from app.storage.database import get_session
+    import threading
 
     session = get_session()
     repo = session.get(Repository, repo_id)
@@ -93,21 +130,119 @@ def summarize(
         scripts = session.execute(
             select(Script).where(Script.repo_id == repo_id)
         ).scalars().all()
-        with console.status(f"[bold green]Summarising {len(scripts)} scripts…"):
-            for s in scripts:
-                summarise_script(s.id, repo_root)
-                console.print(f"  ✓ {s.instance_path or s.file_path}")
+
+        script_ids = [s.id for s in scripts]
+        # Build ID -> path lookup for progress display
+        id_to_path = {s.id: (s.instance_path or s.file_path) for s in scripts}
+
+        completed = {"count": 0}
+        total = len(script_ids)
+        lock = threading.Lock()
+
+        def _on_complete(sid, summary, error):
+            with lock:
+                completed["count"] += 1
+                n = completed["count"]
+            status = "[green]ok[/green]" if not error else f"[red]{error[:60]}[/red]"
+            console.print(f"  [{n}/{total}] {id_to_path.get(sid, sid)} — {status}")
+
+        console.print(f"[bold]Summarising {total} scripts with {workers} workers…[/bold]")
+        summarise_scripts_parallel(
+            script_ids,
+            repo_root,
+            max_workers=workers,
+            on_complete=_on_complete,
+        )
+        console.print(f"[bold green]All {total} scripts summarised.[/bold green]")
 
     domains = session.execute(
         select(Domain).where(Domain.repo_id == repo_id)
     ).scalars().all()
+    # Domains are done sequentially (there are only a few)
     with console.status(f"[bold green]Summarising {len(domains)} domains…"):
         for d in domains:
             summarise_domain(d.id, repo_root)
-            console.print(f"  ✓ {d.name}")
+            console.print(f"  ok {d.name}")
 
     session.close()
     console.print("[bold green]Summarisation complete.[/bold green]")
+
+
+# ── ask ───────────────────────────────────────────────────────────────────
+
+
+@cli.command()
+def ask(
+    question: str = typer.Argument(..., help="Question about the codebase"),
+    repo_id: int = typer.Option(1, "--repo-id", "-r"),
+    scope: str = typer.Option("", "--scope", "-s", help="Optional scope(s) to focus on, comma-separated"),
+):
+    """Ask a question about the codebase using dynamic context retrieval."""
+    from app.models.entities import Repository
+    from app.services.agents.tools import list_scripts, list_domains, get_contracts
+    from app.adapters.gemini_cli import invoke_standalone
+    from app.storage.database import get_session
+
+    session = get_session()
+    repo = session.get(Repository, repo_id)
+    if not repo:
+        console.print(f"[red]Repository {repo_id} not found[/red]")
+        raise typer.Exit(1)
+    session.close()
+
+    # Dynamic context retrieval via agent tools
+    domains = list_domains(repo_id)
+    domain_ctx = "\n".join(
+        f"## Domain: {d['name']} ({d['kind']}, {d['script_count']} scripts)\n{d['summary']}"
+        for d in domains
+    )
+
+    script_ctx = ""
+    if scope:
+        scopes = [s.strip() for s in scope.split(",") if s.strip()]
+        all_scripts = []
+        for sc in scopes:
+            all_scripts.extend(list_scripts(repo_id, pattern=sc))
+        # Deduplicate by id
+        seen = set()
+        unique = []
+        for s in all_scripts:
+            if s["id"] not in seen:
+                seen.add(s["id"])
+                unique.append(s)
+        script_ctx = "\n\n## Relevant Scripts\n" + "\n".join(
+            f"- **{s['instance_path']}** ({s['script_type']}): {s['summary']}"
+            for s in unique
+        )
+
+    contracts = get_contracts(repo_id)
+    contract_ctx = ""
+    if contracts:
+        contract_ctx = "\n\n## Contracts\n" + "\n".join(
+            f"- {c['name']} ({c['kind']}): {c['summary']}" for c in contracts
+        )
+
+    prompt = f"""\
+You are a Roblox/Luau codebase expert. Answer the following question
+using ONLY the repository knowledge provided below. Be concise.
+
+# Repository: {repo.name}
+
+{domain_ctx}
+{script_ctx}
+{contract_ctx}
+
+# Question
+{question}
+"""
+
+    with console.status("[bold green]Thinking..."):
+        result = invoke_standalone(prompt, timeout=60)
+
+    if result.exit_code == 0:
+        console.print(result.stdout.strip())
+    else:
+        console.print(f"[red]Error: {result.stderr[:300]}[/red]")
 
 
 # ── edit ──────────────────────────────────────────────────────────────────
@@ -117,16 +252,28 @@ def summarize(
 def edit(
     description: str = typer.Argument(..., help="Natural-language edit request"),
     repo_id: int = typer.Option(..., "--repo-id", "-r"),
-    scope: str = typer.Option("", "--scope", "-s", help="Target scope (instance path fragment)"),
-    side: str = typer.Option("server", "--side", help="Runtime side: server|client|shared"),
+    scope: str = typer.Option("", "--scope", "-s", help="Target scope(s), comma-separated (e.g. 'DashHandler,CooldownModule')"),
+    side: str = typer.Option("unknown", "--side", help="Runtime side: server|client|shared"),
+    investigation_workers: int | None = typer.Option(None, "--investigation-workers", "-w", help="Parallel workers for investigation (docs + deep read). Default from config."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show each investigation phase's input and subagent output (no spinner)."),
 ):
-    """Assemble a context packet and launch a fresh edit worker."""
+    """Investigate context dynamically, assemble packet, and launch edit worker."""
     from app.models.entities import Task, TaskStatus, Repository
-    from app.services.packets.assembler import assemble_packet
+    from app.services.agents.orchestrator import run_investigation
     from app.services.workers.lifecycle import invoke_edit_worker, save_proposal
+    from app.services.memory.hierarchy import propagate_invalidation
     from app.policies.safety import is_high_risk, require_review
     from app.telemetry.metrics import record_packet, record_worker
     from app.storage.database import get_session
+
+    if side == "unknown":
+        dl = description.lower()
+        if "replicate" in dl or "sync" in dl or "shared" in dl or "remote" in dl:
+            side = "shared"
+        elif "client" in dl and "server" not in dl:
+            side = "client"
+        elif "server" in dl and "client" not in dl:
+            side = "server"
 
     session = get_session()
     repo = session.get(Repository, repo_id)
@@ -135,9 +282,9 @@ def edit(
         raise typer.Exit(1)
 
     if is_high_risk(description):
-        console.print("[yellow]⚠  High-risk task detected. Proceeding with caution.[/yellow]")
+        console.print("[yellow]High-risk task detected. Proceeding with caution.[/yellow]")
 
-    # Create task
+    # 1. Create task
     task = Task(
         repo_id=repo_id,
         description=description,
@@ -150,15 +297,29 @@ def edit(
     task_id = task.id
     session.close()
 
-    # Assemble packet
-    with console.status("[bold green]Assembling context packet…"):
-        packet = assemble_packet(task_id, repo.root_path)
+    # 2. Investigate (agents explore dynamically, packet assembled LAST)
+    if verbose:
+        console.print("[bold green]Investigating (verbose: phase I/O visible)...[/]\n")
+        packet, investigation = run_investigation(task_id, investigation_workers=investigation_workers, verbose=True)
+    else:
+        with console.status("[bold green]Repo investigator exploring..."):
+            packet, investigation = run_investigation(task_id, investigation_workers=investigation_workers)
 
     record_packet(task_id, len(packet.model_dump_json()))
-    console.print(f"[bold]Packet assembled[/bold] — {len(packet.file_bodies)} file bodies")
+    console.print(
+        f"[bold]Investigation complete[/bold] — "
+        f"{len(investigation.relevant_script_ids)} scripts identified, "
+        f"{len(packet.file_bodies)} file bodies in packet"
+    )
+    if investigation.risks:
+        for r in investigation.risks[:3]:
+            console.print(f"  [yellow]Risk:[/yellow] {r}")
+    if investigation.uncertainties:
+        for u in investigation.uncertainties[:3]:
+            console.print(f"  [cyan]Uncertain:[/cyan] {u}")
 
-    # Launch worker
-    with console.status("[bold green]Running edit worker…"):
+    # 3. Launch fresh external edit worker
+    with console.status("[bold green]Running edit worker..."):
         result = invoke_edit_worker(packet, cwd=repo.root_path)
 
     record_worker(task_id, result.worker_type, result.exit_code, result.elapsed_secs)
@@ -166,6 +327,25 @@ def edit(
     if result.patch_content:
         proposal_id = save_proposal(task_id, result.patch_content)
         console.print(f"[bold green]Patch proposal #{proposal_id} saved.[/bold green]")
+
+        # Parse patch to find changed files for invalidation analysis
+        import re
+        changed_files = []
+        for line in result.patch_content.splitlines():
+            if line.startswith("+++ b/"):
+                changed_files.append(line[6:].strip())
+            elif line.startswith("+++ "):
+                changed_files.append(line[4:].strip())
+        
+        if changed_files:
+            from app.services.memory.refresh import analyze_invalidation_impact
+            invalidations = analyze_invalidation_impact(changed_files)
+            if any(invalidations.values()):
+                console.print(
+                    f"[dim]Candidate Impact: Applying this patch will invalidate "
+                    f"{invalidations['script']} scripts, and "
+                    f"{invalidations['domain']} domains.[/dim]"
+                )
 
         if require_review(description, result.patch_content):
             console.print("[yellow]This patch requires manual review before applying.[/yellow]")

@@ -37,6 +37,20 @@ def _estimate_tokens(text: str) -> int:
         return len(text) // 4
 
 
+def truncate_to_tokens(text: str, max_tokens: int, suffix: str = "\n... (truncated)") -> str:
+    """Return text truncated to at most max_tokens (approximate)."""
+    if not text or max_tokens <= 0:
+        return text
+    n = _estimate_tokens(text)
+    if n <= max_tokens:
+        return text
+    # Approximate character count to stay under max_tokens
+    target_len = int(len(text) * max_tokens / n) - len(suffix)
+    if target_len <= 0:
+        return text[: max_tokens * 4] + suffix
+    return text[:target_len] + suffix
+
+
 def _gather_1hop_deps(script_id: int, session) -> list[int]:
     """Return script IDs that are 1-hop require neighbours."""
     edges = session.execute(
@@ -69,14 +83,16 @@ def assemble_packet(
         if task is None:
             raise ValueError(f"Task {task_id} not found")
 
-        # Find target scripts by scope match
+        # Find target scripts by scope match (supports comma-separated scopes)
         target_scripts: list[Script] = []
         if task.target_scope:
+            scopes = [s.strip() for s in task.target_scope.split(",") if s.strip()]
+            from sqlalchemy import or_
             target_scripts = list(
                 session.execute(
                     select(Script).where(
                         Script.repo_id == task.repo_id,
-                        Script.instance_path.contains(task.target_scope),
+                        or_(*(Script.instance_path.contains(s) for s in scopes)),
                     )
                 ).scalars().all()
             )
@@ -143,6 +159,14 @@ def assemble_packet(
                     invariants.append(m.content)
                 elif m.memory_type.value == "episodic":
                     risks.append(m.content)
+
+        # Inject matching skills as procedural invariants
+        from app.services.memory.skill_loader import get_relevant_skills
+        skill_rules = get_relevant_skills(
+            runtime_side=task.runtime_side or "",
+            target_scope=task.target_scope or "",
+        )
+        invariants.extend(skill_rules)
 
         packet = ContextPacketSchema(
             task_id=task_id,

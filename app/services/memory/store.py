@@ -151,8 +151,11 @@ def invalidate_by_file(file_path: str, reason: str = "file_changed") -> int:
         import json
         for rec in candidates:
             refs = json.loads(rec.source_refs_json or "[]")
+            # source_refs_json may be a list of file path strings or a provenance dict (phase, chunk_id, script_ids)
+            if not isinstance(refs, list):
+                continue
             normalised = file_path.replace("\\", "/")
-            if any(normalised in r.replace("\\", "/") for r in refs):
+            if any(normalised in r.replace("\\", "/") for r in refs if isinstance(r, str)):
                 rec.invalidated_by = reason
                 rec.updated_at = _utcnow()
                 count += 1

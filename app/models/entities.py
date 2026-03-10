@@ -51,6 +51,22 @@ class MemoryType(str, enum.Enum):
     environment = "environment"
 
 
+class MemoryPhase(str, enum.Enum):
+    """During a large revamp: stable = pre-revamp, migration = transitional, finalized = post-validation."""
+    stable = "stable"
+    migration = "migration"
+    finalized = "finalized"
+
+
+class MemoryScope(str, enum.Enum):
+    repository = "repository"    # Whole-repo architectural knowledge
+    domain = "domain"            # Domain-level (server/client/shared)
+    script = "script"            # Per-script understanding
+    contract = "contract"        # Cross-cutting contracts (remotes, config)
+    environment = "environment"  # Live Studio state (from MCP)
+    skill = "skill"              # Procedural rules (permanent)
+
+
 class EdgeKind(str, enum.Enum):
     requires = "requires"
     exports = "exports"
@@ -225,11 +241,15 @@ class MemoryRecord(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     scope_id = Column(String, nullable=False)            # e.g. "script:42" or "domain:server"
+    scope_level = Column(Enum(MemoryScope), nullable=True)  # hierarchy layer
+    parent_scope_id = Column(String, nullable=True)      # parent in hierarchy (e.g. domain:server for script:42)
     memory_type = Column(Enum(MemoryType), nullable=False)
+    memory_phase = Column(Enum(MemoryPhase), default=MemoryPhase.stable)  # stable | migration | finalized
     content = Column(Text, nullable=False)
     confidence = Column(Float, default=1.0)
     freshness_ts = Column(DateTime, default=_utcnow)
     source_refs_json = Column(Text, default="[]")
+    derived_from_json = Column(Text, default="[]")       # child scope_ids this was derived from
     promotion_policy = Column(String, default="default")
     invalidated_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
@@ -237,6 +257,18 @@ class MemoryRecord(Base):
 
 
 # ── Task ──────────────────────────────────────────────────────────────────
+
+
+class RevampSession(Base):
+    """One large-change revamp: holds migration brief and batches; tasks can attach to it."""
+    __tablename__ = "revamp_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    repo_id = Column(Integer, ForeignKey("repositories.id"), nullable=False)
+    status = Column(String, default="active")           # active, completed, abandoned
+    migration_brief_json = Column(Text, default="{}")   # old_state, target_state, invariants, migration_steps
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
 class Task(Base):
@@ -248,6 +280,9 @@ class Task(Base):
     status = Column(Enum(TaskStatus), default=TaskStatus.pending)
     target_scope = Column(String, nullable=True)
     runtime_side = Column(String, nullable=True)         # server, client, shared
+    large_change_mode = Column(Integer, default=0)        # 0 = no, 1 = yes (impact planning, migration brief, broader retrieval)
+    revamp_session_id = Column(Integer, ForeignKey("revamp_sessions.id"), nullable=True)
+    batch_index = Column(Integer, nullable=True)          # 1-based batch within revamp (e.g. "introduce transport", "update consumers")
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 

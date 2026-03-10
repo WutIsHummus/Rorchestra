@@ -25,6 +25,13 @@ python -m app.main check ui_existence StarterGui.ScreenGui.MainHUD
 
 # View system status
 python -m app.main status
+
+# Enter the interactive REPL (Rorchestra)
+python -m app.rochester
+# Inside the REPL, you can use:
+# /edit "description"  -> Propose an edit
+# /apply <id>          -> Apply a patch and rebuild memory cascade
+# /mcp                 -> Check connected MCP servers and statuses
 ```
 
 ## Architecture

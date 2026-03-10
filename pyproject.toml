@@ -12,6 +12,7 @@ dependencies = [
     "tiktoken>=0.5",
     "aiofiles>=23.0",
     "rich>=13.0",
+    "prompt_toolkit>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,7 @@ dev = [
 
 [project.scripts]
 orch = "app.main:cli"
+rorchestra = "app.rochester:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]

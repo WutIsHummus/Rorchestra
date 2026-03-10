@@ -1,6 +1,42 @@
-/__pycache__/
-*.pyc
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
 *.egg-info/
-/.venv/
+*.egg
+dist/
+build/
+*.whl
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Rojo build artifacts
+sourcemap.json
+
+# Orchestrator artifacts
 /artifacts/
+
+# Gemini
 .gemini/
+
+# Logs
+*.log

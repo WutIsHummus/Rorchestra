@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     gemini_cli_bin: str = Field(
         default="gemini", description="Path to Gemini CLI binary"
     )
+    # CWD when invoking Gemini CLI so it loads .gemini/settings.json and .gemini/agents/ from the orchestrator.
+    gemini_cli_cwd: Path = Field(
+        default_factory=lambda: Path(__file__).resolve().parent.parent,
+        description="Project directory for Gemini CLI (orchestrator root, where .gemini lives)",
+    )
 
     # MCP server executables / entrypoints
     roblox_studio_mcp_exe: str = Field(
@@ -48,19 +53,60 @@ class Settings(BaseSettings):
         default=Path("artifacts"),
         description="Directory for runtime artifacts (packets, diffs, MCP raw output)",
     )
+    skills_dir: Path = Field(
+        default=Path("skills"),
+        description="Directory containing skill Markdown files with procedural rules",
+    )
 
     # ── Tunables ───────────────────────────────────────────────────────
     default_token_budget: int = Field(
-        default=8000,
-        description="Default token budget for context packets",
+        default=64_000,
+        description="Token budget for context packet file_bodies (shared across all scripts so none are dropped)",
     )
     worker_timeout_secs: int = Field(
-        default=120,
+        default=300,
         description="Default timeout in seconds for worker invocations",
     )
     max_worker_retries: int = Field(
         default=1,
         description="How many times to retry a timed-out worker with smaller packet",
+    )
+    investigation_workers: int = Field(
+        default=2,
+        description="Max parallel workers for investigation (docs + deep read, and chunked domain-investigator)",
+    )
+    investigation_concurrency: int = Field(
+        default=10,
+        description="Global cap on concurrent investigation work (outer chunk workers + inner source-read).",
+    )
+    investigation_phase_timeout_secs: int = Field(
+        default=300,
+        description="Per-phase timeout (docs, deep-read). On timeout, phase returns partial/empty and investigation continues.",
+    )
+    # File/scope limits for revamps (raise these for full-codebase changes)
+    max_domains_triage: int = Field(
+        default=10,
+        description="Max domains to include in Phase 1 triage (0 = no limit; revamps need more than 3).",
+    )
+    max_scripts_per_investigation: int = Field(
+        default=0,
+        description="Max scripts to include in investigation (0 = no limit; set e.g. 500 for very large revamps).",
+    )
+    max_scripts_per_deep_read_chunk: int = Field(
+        default=25,
+        description="Max scripts per deep-read chunk (keeps each prompt bounded; more chunks run in parallel).",
+    )
+    max_deep_read_parallel_chunks: int = Field(
+        default=8,
+        description="Max parallel deep-read chunks so revamps can process many files.",
+    )
+    list_scripts_limit: int = Field(
+        default=200,
+        description="Default max scripts returned by list_scripts (for agents exploring the codebase).",
+    )
+    max_files_per_edit: int = Field(
+        default=25,
+        description="Max files per edit-worker run; when packet has more, run worker in batches and apply each patch.",
     )
 
     # ── Domain mapping ────────────────────────────────────────────────
