@@ -294,6 +294,15 @@ def invoke_edit_worker(
         worker_elapsed = _time.monotonic() - _t0
         _t.print(f"[dim]  ⏱  worker done: {worker_elapsed:.1f}s (exit={result.exit_code}, in={result.input_tokens}, out={result.output_tokens})[/dim]")
 
+        # Debug: dump worker stderr/stdout tail to diagnose no-edit issues
+        if debug or result.exit_code != 0:
+            if result.stderr.strip():
+                _t.print(f"[dim]  ⚠  worker stderr (last 500 chars):[/dim]")
+                _t.print(f"[dim]{result.stderr.strip()[-500:]}[/dim]")
+            if result.stdout.strip():
+                _t.print(f"[dim]  ℹ  worker stdout (last 500 chars):[/dim]")
+                _t.print(f"[dim]{result.stdout.strip()[-500:]}[/dim]")
+
         # Detect what files the worker changed
         _t0 = _time.monotonic()
         after_files = set(_get_changed_files(cwd))

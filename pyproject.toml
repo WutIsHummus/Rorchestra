@@ -1,6 +1,6 @@
 [project]
 name = "rorchestra"
-version = "0.1.0"
+version = "1.0.0"
 description = "Roblox/Luau AI orchestration system for codebase understanding and scoped edit generation"
 readme = "README.md"
 license = {text = "MIT"}
