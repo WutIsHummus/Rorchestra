@@ -22,7 +22,7 @@ pip install rorchestra
 Or install from source:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/rorchestra.git
+git clone https://github.com/WutIsHummus/rorchestra.git
 cd rorchestra
 pip install -e ".[dev]"
 ```
