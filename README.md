@@ -1,5 +1,5 @@
 # Rorchestra
-
+![cli](https://github.com/WutIsHummus/Rorchestra/blob/main/image.png)
 AI-powered orchestration for Roblox/Luau codebases.
 
 Rorchestra ingests your [Rojo](https://rojo.space) project, builds a dependency graph and hierarchical memory, then uses [Gemini CLI](https://github.com/google-gemini/gemini-cli) agents to investigate context and generate scoped code edits from an interactive REPL.
