@@ -26,8 +26,8 @@ class Settings(BaseSettings):
         default="luau-lsp", description="Path to luau-lsp binary"
     )
     gemini_cli_bin: str = Field(
-        default=r"C:\Users\alper\AppData\Roaming\npm\gemini.cmd",
-        description="Path to Gemini CLI binary",
+        default="gemini",
+        description="Path to Gemini CLI binary (assumes on PATH; override with ORCH_GEMINI_CLI_BIN)",
     )
     # CWD when invoking Gemini CLI so it loads .gemini/settings.json and .gemini/agents/ from the orchestrator.
     gemini_cli_cwd: Path = Field(
@@ -37,12 +37,12 @@ class Settings(BaseSettings):
 
     # MCP server executables / entrypoints
     roblox_studio_mcp_exe: str = Field(
-        default=r"C:\Tools\rbx-studio-mcp\rbx-studio-mcp.exe",
-        description="Path to official Roblox Studio MCP executable",
+        default="",
+        description="Path to official Roblox Studio MCP executable (set via ORCH_ROBLOX_STUDIO_MCP_EXE)",
     )
     community_mcp_entrypoint: str = Field(
-        default=r"D:\SPTS\robloxstudio-mcp\packages\robloxstudio-mcp\dist\index.js",
-        description="Path to community robloxstudio-mcp entrypoint",
+        default="npx -y robloxstudio-mcp@latest",
+        description="Command or path for community robloxstudio-mcp (override with ORCH_COMMUNITY_MCP_ENTRYPOINT)",
     )
 
     # Storage
