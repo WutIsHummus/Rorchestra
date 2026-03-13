@@ -40,3 +40,6 @@ sourcemap.json
 
 # Logs
 *.log
+
+# Rorchestra session data
+.rorchestra/

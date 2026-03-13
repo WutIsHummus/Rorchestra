@@ -16,6 +16,7 @@ import sys
 import time
 import shutil
 from datetime import datetime
+from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -39,6 +40,83 @@ console = Console()
 
 _active_repo = None   # Set during main() startup from CWD detection
 _active_repo_id = None
+
+
+# ── Saved plans (disk-persisted) ─────────────────────────────────────────
+
+import json as _json
+from datetime import datetime as _dt
+
+_PLANS_DIR = None  # Set on startup to <repo_root>/.rorchestra/plans/
+
+
+def _get_plans_dir() -> Path:
+    """Get the plans directory, creating it if needed."""
+    global _PLANS_DIR
+    if _PLANS_DIR is None:
+        repo = get_active_repo()
+        if repo:
+            _PLANS_DIR = Path(repo.root_path) / ".rorchestra" / "plans"
+        else:
+            _PLANS_DIR = Path.cwd() / ".rorchestra" / "plans"
+    _PLANS_DIR.mkdir(parents=True, exist_ok=True)
+    return _PLANS_DIR
+
+
+def _save_plan(description: str, packet, investigation, repo_path: str, task_id: int) -> int:
+    """Save a plan to disk and return its ID."""
+    plans_dir = _get_plans_dir()
+
+    # Find next ID
+    existing = sorted(plans_dir.glob("plan_*.json"))
+    next_id = 1
+    if existing:
+        try:
+            next_id = int(existing[-1].stem.split("_")[1]) + 1
+        except (ValueError, IndexError):
+            next_id = len(existing) + 1
+
+    plan_data = {
+        "id": next_id,
+        "description": description,
+        "packet": packet.model_dump() if hasattr(packet, "model_dump") else {},
+        "invariants": list(investigation.invariants) if hasattr(investigation, "invariants") else [],
+        "risks": list(investigation.risks) if hasattr(investigation, "risks") else [],
+        "uncertainties": list(investigation.uncertainties) if hasattr(investigation, "uncertainties") else [],
+        "relevant_script_ids": list(investigation.relevant_script_ids) if hasattr(investigation, "relevant_script_ids") else [],
+        "repo_path": repo_path,
+        "task_id": task_id,
+        "timestamp": _dt.now().isoformat(),
+    }
+
+    path = plans_dir / f"plan_{next_id:03d}.json"
+    path.write_text(_json.dumps(plan_data, indent=2, default=str), encoding="utf-8")
+    return next_id
+
+
+def _load_plans() -> list[dict]:
+    """Load all plans from disk."""
+    plans_dir = _get_plans_dir()
+    plans = []
+    for p in sorted(plans_dir.glob("plan_*.json")):
+        try:
+            data = _json.loads(p.read_text(encoding="utf-8"))
+            plans.append(data)
+        except Exception:
+            pass
+    return plans
+
+
+def _load_plan(plan_id: int) -> dict | None:
+    """Load a specific plan by ID."""
+    plans_dir = _get_plans_dir()
+    path = plans_dir / f"plan_{plan_id:03d}.json"
+    if not path.exists():
+        return None
+    try:
+        return _json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def get_active_repo():
@@ -86,8 +164,8 @@ def _auto_init_from_cwd() -> None:
     import os
     from pathlib import Path
     from app.storage.database import get_session
-    from app.models.entities import Repository
-    from sqlalchemy import select
+    from app.models.entities import Repository, Script, MemoryRecord, Domain
+    from sqlalchemy import select, func
 
     cwd = os.getcwd()
     cwd_path = Path(cwd).resolve()
@@ -103,6 +181,9 @@ def _auto_init_from_cwd() -> None:
                 _active_repo_id = repo.id
                 _info(f"Project: [bold]{repo.name}[/bold]")
                 _dim(str(repo.root_path))
+
+                # Check if summaries are missing
+                _auto_summarize_if_needed(session, repo)
                 return
 
         # Not ingested yet — check if CWD is a Rojo project
@@ -131,6 +212,9 @@ def _auto_init_from_cwd() -> None:
                 if loaded:
                     _dim(f"Skills loaded: {len(loaded)}")
 
+                # Auto-summarize
+                _auto_summarize_if_needed(session, repo)
+
             except Exception as e:
                 _warn(f"Auto-ingest failed: {e}")
                 _dim("Use /ingest <path> manually")
@@ -143,6 +227,82 @@ def _auto_init_from_cwd() -> None:
             _info(f"Project: [bold]{repos[0].name}[/bold]")
     finally:
         session.close()
+
+
+_AUTO_SUMMARIZE_WORKERS = 40
+
+
+def _auto_summarize_if_needed(session, repo) -> None:
+    """Run summarization if scripts are missing memory records."""
+    from app.models.entities import Script, MemoryRecord, Domain
+    from sqlalchemy import select, func
+
+    script_count = session.execute(
+        select(func.count(Script.id)).where(Script.repo_id == repo.id)
+    ).scalar() or 0
+
+    # Count distinct scripts that have at least one summary record
+    # (not total records, which inflates from deep-read, env-validation, etc.)
+    summarized_script_ids = session.execute(
+        select(func.count(func.distinct(MemoryRecord.scope_id))).where(
+            MemoryRecord.scope_id.like("script:%"),
+            MemoryRecord.invalidated_by.is_(None),
+        )
+    ).scalar() or 0
+
+    unsummarized = script_count - summarized_script_ids
+    if unsummarized <= 0:
+        _dim(f"Memory: {summarized_script_ids} summaries up to date")
+        return
+
+    _info(f"Summarizing {unsummarized} unsummarized scripts ({_AUTO_SUMMARIZE_WORKERS} workers)...")
+
+    from app.services.summarization.summarizer import (
+        summarise_scripts_parallel,
+        summarise_domain,
+    )
+
+    scripts = session.execute(
+        select(Script).where(Script.repo_id == repo.id)
+    ).scalars().all()
+
+    script_ids = [s.id for s in scripts]
+
+    import threading
+    completed = {"count": 0, "ok": 0, "fail": 0}
+    total = len(script_ids)
+    lock = threading.Lock()
+
+    def _on_complete(sid, summary, error):
+        with lock:
+            completed["count"] += 1
+            if error:
+                completed["fail"] += 1
+            else:
+                completed["ok"] += 1
+            n = completed["count"]
+        if n % 20 == 0 or n == total:
+            pct = int(n / total * 100)
+            console.print(f"  [{DIM}]Progress: {n}/{total} ({pct}%)[/]")
+
+    summarise_scripts_parallel(
+        script_ids,
+        repo.root_path,
+        max_workers=_AUTO_SUMMARIZE_WORKERS,
+        on_complete=_on_complete,
+    )
+
+    _success(f"Scripts: {completed['ok']} ok, {completed['fail']} failed")
+
+    # Domains (few, sequential)
+    domains = session.execute(
+        select(Domain).where(Domain.repo_id == repo.id)
+    ).scalars().all()
+
+    for d in domains:
+        summarise_domain(d.id, repo.root_path)
+
+    _success(f"Domains: {len(domains)} summarized")
 
 # ── Theme ────────────────────────────────────────────────────────────────
 
@@ -493,13 +653,15 @@ def handle_edit(args: str):
     import re
 
     if not args.strip():
-        _warn("Usage: /edit <description> [--scope X] [--side server|client|shared] [--investigation-workers N] [--verbose|-v]")
+        _warn("Usage: /edit <description> [--scope X] [--side server|client|shared] [--plan] [--debug] [--verbose|-v]")
         return
 
     scope = ""
     side = "unknown"
     investigation_workers = None
     verbose = False
+    plan_only = False
+    debug_mode = False
     m = re.search(r'--scope\s+(\S+)', args)
     if m:
         scope = m.group(1)
@@ -512,11 +674,17 @@ def handle_edit(args: str):
     if m:
         investigation_workers = int(m.group(1))
         args = args[:m.start()] + args[m.end():]
+    if re.search(r'(^|\s)--plan(\s|$)', args):
+        plan_only = True
+        args = re.sub(r'\s*--plan\b', '', args)
+    if re.search(r'(^|\s)--debug(\s|$)', args):
+        debug_mode = True
+        args = re.sub(r'\s*--debug\b', '', args)
     if re.search(r'(^|\s)(--verbose|-v)(\s|$)', args):
         verbose = True
         args = re.sub(r'\s*--verbose\b', '', args)
         args = re.sub(r'\s*-v\b', '', args)
-        args = re.sub(r'\b-v\s*', '', args)  # -v at start of string (after other strips)
+        args = re.sub(r'\b-v\s*', '', args)
 
     description = args.strip().strip('"').strip("'")
     
@@ -559,8 +727,17 @@ def handle_edit(args: str):
     session.close()
 
     # Investigation
+    mode_tags = []
+    if plan_only:
+        mode_tags.append("[bold cyan]PLAN[/]")
+    if debug_mode:
+        mode_tags.append("[bold yellow]DEBUG[/]")
+    if verbose:
+        mode_tags.append("[bold]verbose[/]")
+    mode_str = "  ·  ".join(mode_tags)
+
     _header("Investigating")
-    _dim(f"scope={scope or '(auto)'}  ·  side={side}" + ("  ·  [bold]verbose[/]" if verbose else ""))
+    _dim(f"scope={scope or '(auto)'}  ·  side={side}" + (f"  ·  {mode_str}" if mode_str else ""))
     console.print()
 
     if verbose:
@@ -592,6 +769,73 @@ def handle_edit(args: str):
     for u in investigation.uncertainties[:3]:
         _info(f"Uncertain: {u}")
 
+    # ── Plan mode: show details and stop ──
+    if plan_only:
+        console.print()
+        _header("Plan Details")
+
+        # Show target files
+        _info("Target files:")
+        for fp in sorted(packet.file_bodies.keys()):
+            _dim(f"  {fp}")
+
+        # Show invariants
+        if investigation.invariants:
+            console.print()
+            _info("Invariants:")
+            for inv in investigation.invariants:
+                console.print(f"  [{A1}]•[/] {inv}")
+
+        # Show risks
+        if investigation.risks:
+            console.print()
+            _info("Risks:")
+            for r in investigation.risks:
+                console.print(f"  [{WARN}]⚠[/] {r}")
+
+        # Show relevant scripts
+        if packet.relevant_scripts:
+            console.print()
+            _info("Scripts:")
+            for s in packet.relevant_scripts:
+                path = s.get('instance_path', s.get('file_path', '?'))
+                console.print(f"  [{DIM}]{path}[/]")
+
+        # Save plan to disk for later retrieval
+        plan_id = _save_plan(description, packet, investigation, repo.root_path, task_id)
+
+        console.print()
+        _success(f"Plan #{plan_id} saved.")
+        console.print()
+
+        # Interactive prompt: execute, edit description, or cancel
+        try:
+            choice = console.input(f"  [{A1}]Execute this plan?[/] ([bold]y[/]es / [bold]n[/]o / [bold]e[/]dit description): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = "n"
+
+        if choice in ("n", "no", ""):
+            _dim("Cancelled.")
+            return
+        elif choice in ("e", "edit"):
+            try:
+                new_desc = console.input(f"  [{A1}]New description:[/] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                _dim("Cancelled.")
+                return
+            if new_desc:
+                # Update the packet objective with the edited description
+                packet.objective = new_desc
+                _info(f"Updated objective: {new_desc}")
+            else:
+                _dim("No change, proceeding with original.")
+        elif choice not in ("y", "yes"):
+            _dim("Cancelled.")
+            return
+
+        # Fall through to the edit worker below
+        console.print()
+
     # Worker: batch by max_files_per_edit when many files so each run gets a bounded set
     from app.config import settings
     from app.models.schemas import ContextPacketSchema
@@ -602,10 +846,57 @@ def handle_edit(args: str):
     n_files = len(file_paths)
 
     if n_files <= max_per_edit:
+        # Debug: show the full internal plan before sending to worker
+        if debug_mode:
+            console.print()
+            _header("Debug: Internal Plan")
+
+            console.print(f"  [{DIM}]Objective:[/]  {packet.objective}")
+            console.print(f"  [{DIM}]Scope:[/]      {packet.target_scope or '(auto)'}")
+            console.print(f"  [{DIM}]Side:[/]       {packet.runtime_side}")
+            console.print(f"  [{DIM}]Files:[/]      {n_files}")
+            console.print(f"  [{DIM}]CWD:[/]        {repo.root_path}")
+            console.print()
+
+            _info("Invariants sent to worker:")
+            for inv in (packet.local_invariants or []):
+                console.print(f"  [{A1}]•[/] {inv}")
+
+            if packet.known_risks:
+                console.print()
+                _info("Risks sent to worker:")
+                for r in packet.known_risks:
+                    console.print(f"  [{WARN}]⚠[/] {r}")
+
+            if packet.uncertainties:
+                console.print()
+                _info("Uncertainties:")
+                for u in packet.uncertainties:
+                    console.print(f"  [{DIM}]?[/] {u}")
+
+            console.print()
+            _info("File bodies:")
+            for fp, body in packet.file_bodies.items():
+                lines = body.count('\n') + 1 if body else 0
+                console.print(f"  [{DIM}]{fp}[/] ({lines} lines)")
+
+            # Show the prompt that will be sent
+            from app.services.workers.lifecycle import _build_tool_prompt
+            worker_prompt = _build_tool_prompt(packet)
+            console.print()
+            _info("Worker prompt preview (first 2000 chars):")
+            console.print(Panel(
+                worker_prompt[:2000] + ("\n..." if len(worker_prompt) > 2000 else ""),
+                border_style=DIM,
+                box=box.SIMPLE,
+                padding=(0, 1),
+            ))
+            console.print()
+
         # Single run
         console.print()
         with console.status(f"  [{P1}]⚙️  Edit worker running...[/]", spinner="dots"):
-            result = invoke_edit_worker(packet, cwd=repo.root_path)
+            result = invoke_edit_worker(packet, cwd=repo.root_path, debug=debug_mode)
         _print_token_line(result)
         result_patch = result.patch_content
         single_run = True
@@ -726,7 +1017,9 @@ def handle_edit(args: str):
         if single_run:
             _error(f"Worker failed (exit={result.exit_code})")
             if result.stderr:
-                _dim(result.stderr[:400])
+                _dim(result.stderr[-600:])
+            if result.stdout and result.exit_code != 0:
+                _dim(result.stdout[-600:])
         else:
             _error("No patches produced from batched edit.")
 
@@ -750,17 +1043,11 @@ def handle_ask(args: str):
     from app.models.entities import Repository
     from app.services.agents.tools import list_scripts, list_domains, get_contracts
     from app.adapters.gemini_cli import invoke_standalone
-    from app.storage.database import get_session
-    from sqlalchemy import select
 
-    session = get_session()
-    repos = session.execute(select(Repository)).scalars().all()
-    if not repos:
+    repo = get_active_repo()
+    if not repo:
         _error("No repositories. Use /ingest first.")
-        session.close()
         return
-    repo = repos[0]
-    session.close()
 
     domains = list_domains(repo.id)
     domain_ctx = "\n".join(
@@ -802,7 +1089,7 @@ You are a Roblox/Luau codebase expert. Answer concisely.
 """
 
     with console.status(f"  [{P1}]💭 Thinking...[/]", spinner="dots"):
-        result = invoke_standalone(prompt, timeout=120)
+        result = invoke_standalone(prompt, timeout=120, cwd=repo.root_path)
 
     _print_token_line(result)
 
@@ -1064,6 +1351,120 @@ def handle_natural_language(text: str):
     handle_ask(text)
 
 
+def handle_plans(args: str):
+    """List, view, or execute saved plans."""
+    args = args.strip()
+
+    # /plans run <N> — execute a saved plan
+    if args.lower().startswith("run"):
+        num_str = args[3:].strip()
+        if not num_str.isdigit():
+            _warn("Usage: /plans run <N>")
+            return
+        plan_id = int(num_str)
+        plan = _load_plan(plan_id)
+        if not plan:
+            _error(f"Plan #{plan_id} not found. Use /plans to list.")
+            return
+
+        _header(f"Executing Plan #{plan_id}")
+        _dim(plan["description"][:100])
+        console.print()
+
+        # Reconstruct packet from saved JSON
+        from app.models.schemas import ContextPacketSchema
+        packet = ContextPacketSchema(**plan["packet"])
+        repo_path = plan["repo_path"]
+
+        from app.config import settings
+        from app.services.workers.lifecycle import invoke_edit_worker
+        from app.services.patch_apply import apply_patch_to_dir
+
+        max_per_edit = getattr(settings, "max_files_per_edit", 25)
+        file_paths = list(packet.file_bodies.keys())
+        n_files = len(file_paths)
+
+        if n_files <= max_per_edit:
+            with console.status(f"  [{P1}]⚙️  Edit worker running...[/]", spinner="dots"):
+                result = invoke_edit_worker(packet, cwd=repo_path)
+            _print_token_line(result)
+
+            if result.patch_content:
+                applied, errs = apply_patch_to_dir(result.patch_content, repo_path)
+                if applied:
+                    _success(f"Applied changes to {len(applied)} file(s)")
+                    for f in applied:
+                        _dim(f"  {f}")
+                for e in errs:
+                    _warn(e)
+            elif result.exit_code == 0:
+                _success("Worker completed (changes applied directly)")
+            else:
+                _error(f"Worker failed (exit={result.exit_code})")
+                if result.stderr:
+                    _dim(result.stderr[:300])
+        else:
+            _warn(f"Plan has {n_files} files — batched execution not yet supported via /plans run.")
+            _dim("Run the original /edit command without --plan instead.")
+        return
+
+    # /plans <N> — view a specific plan
+    if args.isdigit():
+        plan_id = int(args)
+        plan = _load_plan(plan_id)
+        if not plan:
+            _error(f"Plan #{plan_id} not found.")
+            return
+
+        packet_data = plan.get("packet", {})
+        ts = plan.get("timestamp", "")[:19].replace("T", " ")
+
+        _header(f"Plan #{plan_id}  ({ts})")
+        console.print(f"  [{DIM}]Description:[/] {plan['description'][:120]}")
+        console.print(f"  [{DIM}]Files:[/]       {len(packet_data.get('file_bodies', {}))}")
+        console.print(f"  [{DIM}]Invariants:[/]  {len(plan.get('invariants', []))}")
+        console.print(f"  [{DIM}]Risks:[/]       {len(plan.get('risks', []))}")
+        console.print()
+
+        _info("Files:")
+        for fp in sorted(packet_data.get("file_bodies", {}).keys()):
+            _dim(f"  {fp}")
+
+        if plan.get("invariants"):
+            console.print()
+            _info("Invariants:")
+            for inv_text in plan["invariants"]:
+                console.print(f"  [{A1}]•[/] {inv_text}")
+
+        if plan.get("risks"):
+            console.print()
+            _info("Risks:")
+            for r in plan["risks"]:
+                console.print(f"  [{WARN}]⚠[/] {r}")
+
+        console.print()
+        _dim(f"Run with: /plans run {plan_id}")
+        return
+
+    # /plans — list all saved plans
+    plans = _load_plans()
+    if not plans:
+        _dim("No saved plans. Use /edit <desc> --plan to create one.")
+        return
+
+    _header("Saved Plans")
+    for p in plans:
+        ts = p.get("timestamp", "")[:16].replace("T", " ")
+        n_files = len(p.get("packet", {}).get("file_bodies", {}))
+        desc_short = p["description"][:80]
+        console.print(
+            f"  [{A1}]#{p['id']}[/]  [{DIM}]{ts}[/]  "
+            f"[{MUTED}]{n_files} files[/]  {desc_short}"
+        )
+    console.print()
+    _dim("View: /plans <N>  ·  Execute: /plans run <N>")
+
+
 # ── Command dispatch ────────────────────────────────────────────────────
 
 
@@ -1074,6 +1475,8 @@ HANDLERS = {
     "/summarize": handle_summarize,
     "/edit": handle_edit,
     "/ask": handle_ask,
+    "/plans": handle_plans,
+    "/plan": handle_plans,
     "/skills": handle_skills,
     "/apply": handle_apply,
     "/normalize": handle_normalize,
@@ -1151,13 +1554,20 @@ def main():
         complete_while_typing=True,
     )
 
+    last_interrupt = 0.0
     while True:
         try:
             user_input = session.prompt(_get_prompt)
             dispatch(user_input)
             console.print()
+            last_interrupt = 0.0
         except KeyboardInterrupt:
-            console.print(f"\n  [{DIM}]Press Ctrl+C again or use /quit to exit[/]")
+            now = time.time()
+            if now - last_interrupt < 1.5:
+                console.print(f"\n  [{P1}]👋 Goodbye![/]\n")
+                break
+            last_interrupt = now
+            console.print(f"\n  [{DIM}]Press Ctrl+C again to exit[/]")
         except EOFError:
             console.print(f"\n  [{P1}]👋 Goodbye![/]\n")
             break

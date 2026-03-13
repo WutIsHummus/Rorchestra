@@ -84,6 +84,39 @@ class RiskEntry(BaseModel):
     provenance: InvestigationProvenance
 
 
+# ── Selection Provenance (Hybrid Triage) ─────────────────────────────────
+
+
+class SelectionProvenance(BaseModel):
+    """Tracks why a domain/script/contract was selected during triage."""
+    selected_by: str       # "bm25", "graph_expansion", "pattern_match",
+                           # "ai_investigator", "ai_neighbor_request", "explicit_scope"
+    selection_reason: str  # human-readable explanation
+    evidence_refs: list[str] = Field(default_factory=list)  # memory/edge/script IDs
+    confidence: float = 0.7
+
+
+class SelectedDomain(BaseModel):
+    domain_id: int
+    domain_name: str
+    provenance: SelectionProvenance
+
+
+class SelectedScript(BaseModel):
+    script_id: int
+    instance_path: str
+    provenance: SelectionProvenance
+
+
+class SelectedContract(BaseModel):
+    contract_id: int
+    contract_name: str
+    provenance: SelectionProvenance
+
+
+# ── Investigation merge (deterministic dedupe) ───────────────────────────
+
+
 def _normalize_merge_key(text: str) -> str:
     """Deterministic key for deduplication: strip, lower, collapse whitespace."""
     return " ".join(str(text).strip().lower().split())
@@ -153,6 +186,7 @@ class ContextPacketSchema(BaseModel):
     objective: str
     target_scope: str
     runtime_side: str                          # server | client | shared
+    task_class: str = ""                       # semantic_localized | cross_cutting | migration_refactor | runtime_uncertain
     rojo_path: str | None = None
     expected_instance_path: str | None = None
     relevant_scripts: list[dict[str, Any]] = Field(default_factory=list)
@@ -163,6 +197,7 @@ class ContextPacketSchema(BaseModel):
     validation_requirements: list[str] = Field(default_factory=list)
     file_bodies: dict[str, str] = Field(default_factory=dict)
     migration_brief: dict[str, Any] = Field(default_factory=dict)  # large-change: old_state, target_state, invariants, steps
+    selection_provenance: list[dict[str, Any]] = Field(default_factory=list)  # provenance summaries from hybrid triage
     token_budget: int = 8000
 
 

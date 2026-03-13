@@ -5,6 +5,7 @@ Gemini CLI adapter — subprocess wrapper for standalone and subagent invocation
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -23,6 +24,24 @@ _NOISE_PREFIXES = [
     "MCP issues detected.",
     "Run /mcp list for status.",
     "Loaded cached credentials.",
+    "ClearcutLogger:",
+    "Error flushing log events:",
+    "[MESSAGE_BUS]",
+    "Flushing log events to Clearcut.",
+]
+
+# Patterns that indicate Node.js stack trace lines (from node-pty, etc.)
+_NOISE_PATTERNS = [
+    "at Module._compile",
+    "at Object..js",
+    "at Module.load",
+    "at Function._load",
+    "at TracingChannel.traceSync",
+    "at wrapModuleLoad",
+    "at Function.executeUserEntryPoint",
+    "at node:internal/",
+    "conpty_console_list_agent.js",
+    "Node.js v",
 ]
 
 
@@ -37,6 +56,8 @@ def _strip_cli_noise(text: str) -> str:
         stripped = line.strip()
         if any(stripped.startswith(p) for p in _NOISE_PREFIXES):
             continue
+        if any(p in stripped for p in _NOISE_PATTERNS):
+            continue
         cleaned.append(line)
     return "\n".join(cleaned).strip()
 
@@ -45,9 +66,10 @@ def _parse_json_output(raw: str) -> tuple[str, int, int]:
     """
     Parse Gemini CLI ``--output-format json`` output.
 
-    Each line is a separate JSON object. We extract:
-      - concatenated text parts as the model response
-      - summed input/output token counts from usageMetadata
+    Handles multiple output formats:
+      1. Single JSON object: {"session_id": ..., "response": "...", "stats": {...}}
+      2. NDJSON (one JSON object per line) with candidates/parts
+      3. Mixed output with JSON embedded in noise lines
 
     Returns (response_text, input_tokens, output_tokens).
     """
@@ -55,6 +77,32 @@ def _parse_json_output(raw: str) -> tuple[str, int, int]:
     input_tokens = 0
     output_tokens = 0
 
+    # --- Strategy 1: Try parsing the entire output as a single JSON object ---
+    stripped = raw.strip()
+    try:
+        obj = json.loads(stripped)
+        if isinstance(obj, dict):
+            # New format: {"session_id": ..., "response": "text", "stats": {...}}
+            if "response" in obj and isinstance(obj["response"], str):
+                text_parts.append(obj["response"])
+
+                # Extract tokens from stats.models
+                stats = obj.get("stats", {})
+                for model_info in stats.get("models", {}).values():
+                    tokens = model_info.get("tokens", {})
+                    input_tokens += tokens.get("input", 0) or tokens.get("prompt", 0)
+                    output_tokens += tokens.get("candidates", 0)
+
+                return "".join(text_parts), input_tokens, output_tokens
+
+            # Older format: top-level "result" key
+            if "result" in obj and isinstance(obj["result"], str):
+                text_parts.append(obj["result"])
+                return "".join(text_parts), input_tokens, output_tokens
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # --- Strategy 2: NDJSON (one JSON object per line) ---
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -64,30 +112,39 @@ def _parse_json_output(raw: str) -> tuple[str, int, int]:
         except json.JSONDecodeError:
             continue
 
-        # Extract text from candidates/parts
+        if not isinstance(obj, dict):
+            continue
+
+        # Extract text from candidates/parts (Gemini API format)
         for candidate in obj.get("candidates", []):
             content = candidate.get("content", {})
             for part in content.get("parts", []):
                 if "text" in part:
                     text_parts.append(part["text"])
 
-        # Extract token counts from usageMetadata
+        # Check top-level text keys
+        if "response" in obj and isinstance(obj["response"], str):
+            text_parts.append(obj["response"])
+        elif "result" in obj and isinstance(obj["result"], str):
+            text_parts.append(obj["result"])
+
+        # Extract token counts
         usage = obj.get("usageMetadata", {})
         if usage:
             input_tokens += usage.get("promptTokenCount", 0)
             output_tokens += usage.get("candidatesTokenCount", 0)
 
-        # Also check top-level "result" or "response" key (some CLI versions)
-        if "result" in obj and isinstance(obj["result"], str):
-            text_parts.append(obj["result"])
-        if "response" in obj and isinstance(obj["response"], str):
-            text_parts.append(obj["response"])
-
-        # Check for modelUsage key variant
         model_usage = obj.get("modelUsage", {})
         if model_usage:
             input_tokens += model_usage.get("inputTokens", 0)
             output_tokens += model_usage.get("outputTokens", 0)
+
+        # Stats block
+        stats = obj.get("stats", {})
+        for model_info in stats.get("models", {}).values():
+            tokens = model_info.get("tokens", {})
+            input_tokens += tokens.get("input", 0) or tokens.get("prompt", 0)
+            output_tokens += tokens.get("candidates", 0)
 
     response_text = "".join(text_parts) if text_parts else raw
     return response_text, input_tokens, output_tokens
@@ -99,19 +156,35 @@ def invoke_standalone(
     allowed_tools: list[str] | None = None,
     timeout: int | None = None,
     cwd: str | None = None,
+    debug: bool = False,
+    no_mcp: bool = False,
 ) -> WorkerResult:
     """
     Launch a fresh Gemini CLI process with a one-shot prompt.
 
     The prompt is passed via stdin so it can be arbitrarily long.
-    Uses ``--output-format json`` to capture structured token usage.
+    Uses ``-p`` for proper headless mode and ``--output-format json``
+    for structured token usage.
+
+    no_mcp: If True, blocks MCP server initialization via
+            --allowed-mcp-server-names (faster startup).
     """
     timeout = timeout or settings.worker_timeout_secs
-    cmd = [settings.gemini_cli_bin, "--output-format", "json"]
+    cmd = [
+        settings.gemini_cli_bin,
+        "--output-format", "json",
+    ]
 
     if allowed_tools:
-        for tool in allowed_tools:
-            cmd += ["--tool", tool]
+        # Auto-approve all tool usage in headless worker mode
+        cmd += ["--yolo"]
+
+    # Block MCP if requested or if using allowed_tools (workers don't need MCP)
+    if no_mcp or allowed_tools:
+        cmd += ["--allowed-mcp-server-names", "_no_mcp_"]
+
+    if debug:
+        cmd += ["--debug"]
 
     t0 = time.monotonic()
     try:
@@ -124,6 +197,7 @@ def invoke_standalone(
             cwd=cwd,
             shell=_SHELL,
             encoding="utf-8",
+            env={**os.environ, "GEMINI_CLI_HEADLESS": "1"},
         )
         elapsed = time.monotonic() - t0
 
@@ -175,6 +249,7 @@ def invoke_subagent(
     agents_dir: Path | None = None,
     timeout: int | None = None,
     cwd: str | None = None,
+    no_mcp: bool = True,
 ) -> WorkerResult:
     """
     Invoke a Gemini CLI subagent by name.
@@ -182,7 +257,7 @@ def invoke_subagent(
     The agent Markdown definition is expected at
     ``<agents_dir>/<agent_name>.md``.
 
-    This uses the experimental Gemini CLI subagent system.
+    no_mcp: Blocks MCP server init by default for faster startup.
     """
     timeout = timeout or settings.worker_timeout_secs
 
@@ -193,4 +268,5 @@ def invoke_subagent(
         prompt,
         timeout=timeout,
         cwd=cwd,
+        no_mcp=no_mcp,
     )

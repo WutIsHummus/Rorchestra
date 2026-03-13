@@ -26,7 +26,8 @@ class Settings(BaseSettings):
         default="luau-lsp", description="Path to luau-lsp binary"
     )
     gemini_cli_bin: str = Field(
-        default="gemini", description="Path to Gemini CLI binary"
+        default=r"C:\Users\alper\AppData\Roaming\npm\gemini.cmd",
+        description="Path to Gemini CLI binary",
     )
     # CWD when invoking Gemini CLI so it loads .gemini/settings.json and .gemini/agents/ from the orchestrator.
     gemini_cli_cwd: Path = Field(
@@ -107,6 +108,20 @@ class Settings(BaseSettings):
     max_files_per_edit: int = Field(
         default=25,
         description="Max files per edit-worker run; when packet has more, run worker in batches and apply each patch.",
+    )
+
+    # ── Hybrid triage ─────────────────────────────────────────────────
+    max_ai_domain_additions: int = Field(
+        default=2,
+        description="Max extra domains the AI investigator can add beyond the deterministic prefilter set.",
+    )
+    max_ai_neighbor_requests: int = Field(
+        default=5,
+        description="Max neighbor scripts the AI investigator can request during script triage.",
+    )
+    triage_ai_timeout_secs: int = Field(
+        default=180,
+        description="Timeout for each AI triage review call (Phase 1b, Phase 2b). On timeout, falls back to prefilter.",
     )
 
     # ── Domain mapping ────────────────────────────────────────────────

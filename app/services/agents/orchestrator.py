@@ -25,12 +25,16 @@ from typing import Any
 
 from app.adapters.gemini_cli import invoke_standalone
 from app.config import settings
-from app.models.entities import Repository, Task, TaskStatus, MemoryScope
+from app.models.entities import Repository, Task, TaskStatus, TaskClass, MemoryScope
 from app.models.schemas import (
     ContextPacketSchema,
     InvestigationProvenance,
     InvariantEntry,
     RiskEntry,
+    SelectionProvenance,
+    SelectedDomain,
+    SelectedScript,
+    SelectedContract,
     merge_invariant_entries,
     merge_risk_entries,
 )
@@ -60,6 +64,38 @@ def _get_concurrency_semaphore() -> threading.Semaphore:
         return _investigation_semaphore
 
 
+# ── Task Classification ──────────────────────────────────────────────────
+
+_CROSS_CUTTING_KEYWORDS = {
+    "decouple", "refactor", "restructure", "architecture", "cross-cutting",
+    "all scripts", "every script", "system-wide", "codebase", "everywhere",
+    "contract", "interface", "coupling", "dependency",
+}
+_MIGRATION_KEYWORDS = {
+    "migrate", "migration", "rewrite", "convert", "replace all",
+    "deprecate", "large-scale", "revamp", "overhaul", "rearchitect",
+}
+_RUNTIME_KEYWORDS = {
+    "teleport", "disappear", "runtime", "live", "studio", "in-game",
+    "after join", "on spawn", "on death", "not showing", "invisible",
+    "broken in", "only happens when",
+}
+
+
+def classify_task(task: Task) -> TaskClass:
+    """Deterministic task classification via keyword heuristics."""
+    desc = (task.description or "").lower()
+    tokens = set(desc.split())
+
+    if any(k in desc for k in _MIGRATION_KEYWORDS):
+        return TaskClass.migration_refactor
+    if any(k in desc for k in _CROSS_CUTTING_KEYWORDS):
+        return TaskClass.cross_cutting
+    if any(k in desc for k in _RUNTIME_KEYWORDS):
+        return TaskClass.runtime_uncertain
+    return TaskClass.semantic_localized
+
+
 @dataclass
 class InvestigationReport:
     """Structured output from the investigation phase."""
@@ -71,6 +107,10 @@ class InvestigationReport:
     risks: list[str] = field(default_factory=list)
     uncertainties: list[str] = field(default_factory=list)
     agent_notes: str = ""
+    # Selection provenance from hybrid triage
+    selected_domains: list[SelectedDomain] = field(default_factory=list)
+    selected_scripts: list[SelectedScript] = field(default_factory=list)
+    selected_contracts: list[SelectedContract] = field(default_factory=list)
     # Large-change (revamp) workflow
     impact_script_ids: list[int] = field(default_factory=list)
     impact_contract_ids: list[int] = field(default_factory=list)
@@ -225,11 +265,159 @@ def _triage_domains(task: Task, repo: Repository, session: Session) -> list[int]
         if score > 0:
             scored.append((score, item["id"]))
 
+    # If no keywords matched (vague/broad task), include all domains
+    if not scored:
+        scored = [(0.1, item["id"]) for item in mem_source]
+
     scored.sort(key=lambda x: x[0], reverse=True)
     cap = getattr(settings, "max_domains_triage", 10)
     if cap <= 0:
         return [did for _score, did in scored]
     return [did for _score, did in scored[:cap]]
+
+
+def _ai_review_domains(
+    task: Task,
+    prefilter: list[tuple[float, int]],
+    session: Session,
+    repo: Repository,
+    console,
+    *,
+    verbose: bool = False,
+) -> list[SelectedDomain]:
+    """
+    Phase 1b: AI Investigator Review of domain candidates.
+    Receives the BM25-scored prefilter output and can reorder, expand (bounded),
+    narrow, and explain. Falls back to prefilter on timeout/error.
+    """
+    from app.models.entities import Domain
+
+    # Build candidate info for the prompt
+    domain_info = []
+    for score, did in prefilter:
+        d = session.get(Domain, did)
+        if d:
+            domain_info.append({
+                "id": did,
+                "name": d.name,
+                "kind": d.kind.value if d.kind else "shared",
+                "summary": d.summary or "(no summary)",
+                "bm25_score": round(score, 2),
+            })
+
+    # All available domains (for AI to request additions)
+    all_domains = session.execute(
+        select(Domain).where(Domain.repo_id == repo.id)
+    ).scalars().all()
+    prefilter_ids = {did for _, did in prefilter}
+    available_extras = [
+        {"id": d.id, "name": d.name, "kind": d.kind.value if d.kind else "shared"}
+        for d in all_domains if d.id not in prefilter_ids
+    ]
+
+    task_class = task.task_class.value if task.task_class else "semantic_localized"
+    prompt = f"""\
+You are a repo-investigator for a Roblox/Luau project.
+Your job is to review domain candidates selected by BM25 and decide which are truly relevant.
+
+# Task
+{task.description}
+
+## Task Class: {task_class}
+## Target Scope: {task.target_scope or "(auto)"}
+## Runtime Side: {task.runtime_side or "unknown"}
+
+## BM25-Ranked Domain Candidates
+{json.dumps(domain_info, indent=2)}
+
+## Other Available Domains (not in candidates)
+{json.dumps(available_extras, indent=2)}
+
+## Instructions
+- Review each candidate. Keep domains that are relevant; drop those that scored well lexically but are semantically irrelevant.
+- You may add up to {settings.max_ai_domain_additions} extra domains from the "Other Available" list if architecturally necessary.
+- For each selected domain, provide a 1-line reason.
+- Return ONLY a JSON object:
+```json
+{{
+    "selected": [
+        {{"id": 1, "reason": "owns the DataManager module", "confidence": 0.9}},
+    ],
+    "dropped": [
+        {{"id": 3, "reason": "UI domain not relevant to save logic"}}
+    ]
+}}
+```
+"""
+    if not verbose:
+        console.print(f"[dim]  Phase 1b: AI reviewing {len(domain_info)} domain candidates...[/dim]")
+
+    gemini_cwd = str(settings.gemini_cli_cwd) if getattr(settings, "gemini_cli_cwd", None) else repo.root_path
+    result = invoke_standalone(prompt, timeout=settings.triage_ai_timeout_secs, cwd=gemini_cwd, no_mcp=True)
+
+    if verbose:
+        _verbose_phase_io(console, "Domain Investigator (Phase 1b)", prompt[:3000], result)
+
+    # Parse AI response; on failure, fall back to prefilter with BM25 provenance
+    domain_by_id = {d.id: d for d in all_domains}
+    fallback = [
+        SelectedDomain(
+            domain_id=did,
+            domain_name=domain_by_id[did].name if did in domain_by_id else f"domain:{did}",
+            provenance=SelectionProvenance(
+                selected_by="bm25",
+                selection_reason=f"BM25 score {score:.2f}",
+                evidence_refs=[f"bm25_score:{score:.2f}"],
+                confidence=min(0.9, 0.5 + score * 0.1),
+            ),
+        )
+        for score, did in prefilter
+        if did in domain_by_id
+    ]
+
+    if result.exit_code != 0:
+        console.print(f"[dim]  Phase 1b: AI review failed (exit {result.exit_code}), using prefilter.[/dim]")
+        return fallback
+
+    parsed = _try_parse_json(result.stdout.strip() if result.stdout else "")
+    if not parsed or "selected" not in parsed:
+        console.print(f"[dim]  Phase 1b: AI response unparseable, using prefilter.[/dim]")
+        return fallback
+
+    selected: list[SelectedDomain] = []
+    additions_count = 0
+    for entry in parsed.get("selected", []):
+        did = entry.get("id")
+        reason = entry.get("reason", "AI selected")
+        confidence = entry.get("confidence", 0.8)
+        if did not in domain_by_id:
+            continue
+        is_addition = did not in prefilter_ids
+        if is_addition:
+            if additions_count >= settings.max_ai_domain_additions:
+                continue
+            additions_count += 1
+        selected.append(SelectedDomain(
+            domain_id=did,
+            domain_name=domain_by_id[did].name,
+            provenance=SelectionProvenance(
+                selected_by="ai_investigator" if is_addition else "bm25+ai_confirmed",
+                selection_reason=reason,
+                evidence_refs=[f"bm25_score:{next((s for s, d in prefilter if d == did), 0):.2f}"] if not is_addition else [],
+                confidence=confidence,
+            ),
+        ))
+
+    if not selected:
+        return fallback
+
+    n_dropped = len(parsed.get("dropped", []))
+    console.print(
+        f"[cyan]Phase 1b: AI Review[/] -> Kept {len(selected)} domains"
+        f"{f', added {additions_count}' if additions_count else ''}"
+        f"{f', dropped {n_dropped}' if n_dropped else ''}."
+    )
+    return selected
 
 def _content_patterns_for_task(description: str) -> list[str] | None:
     """If the task is about replication/stats/Value Object, return patterns to find all affected scripts."""
@@ -369,8 +557,11 @@ def _triage_scripts(
 
     if impact_script_ids:
         valid_scripts = session.execute(select(Script).where(Script.id.in_(impact_script_ids))).scalars().all()
-    else:
+    elif domain_ids:
         valid_scripts = session.execute(select(Script).where(Script.domain_id.in_(domain_ids))).scalars().all()
+    else:
+        # No domain filter — fall back to all scripts in the repo
+        valid_scripts = session.execute(select(Script).where(Script.repo_id == task.repo_id)).scalars().all()
     s_docs: list[dict[str, Any]] = []
     for s in valid_scripts:
         name = (s.instance_path or "").split(".")[-1] or (s.file_path or "").split("/")[-1].split("\\")[-1]
@@ -505,6 +696,204 @@ def _triage_scripts(
     final_contract_ids = list(dict.fromkeys(final_contract_ids + list(contract_ids_from_seeds)))
 
     return final_script_ids, final_contract_ids
+
+
+def _ai_review_scripts(
+    task: Task,
+    prefilter_script_ids: list[int],
+    prefilter_contract_ids: list[int],
+    selected_domains: list[SelectedDomain],
+    session: Session,
+    repo: Repository,
+    console,
+    *,
+    verbose: bool = False,
+) -> tuple[list[SelectedScript], list[SelectedContract]]:
+    """
+    Phase 2b: AI Investigator Review of script/contract candidates.
+    Receives the BM25+graph-expansion output and can explain, request neighbors,
+    flag missing scripts, and drop irrelevant ones. Falls back to prefilter.
+    """
+    from app.models.entities import Script, Contract
+
+    # Build candidate info (summaries only — no source code)
+    script_info = []
+    for sid in prefilter_script_ids[:50]:  # Cap prompt size
+        s = session.get(Script, sid)
+        if s:
+            script_info.append({
+                "id": sid,
+                "instance_path": s.instance_path or s.file_path,
+                "script_type": s.script_type,
+                "summary": s.summary or "(no summary)",
+            })
+
+    domain_context = [{"name": sd.domain_name, "reason": sd.provenance.selection_reason} for sd in selected_domains]
+    task_class = task.task_class.value if task.task_class else "semantic_localized"
+
+    prompt = f"""\
+You are a script-investigator for a Roblox/Luau project.
+Your job is to review script candidates selected by BM25 + graph expansion.
+You do NOT read source code — work from summaries and metadata only.
+
+# Task
+{task.description}
+
+## Task Class: {task_class}
+## Target Scope: {task.target_scope or "(auto)"}
+## Runtime Side: {task.runtime_side or "unknown"}
+
+## Selected Domains
+{json.dumps(domain_context, indent=2)}
+
+## Script Candidates (top {len(script_info)})
+{json.dumps(script_info, indent=2)}
+
+## Instructions
+- For each candidate, decide keep or drop with a 1-line reason.
+- You may request up to {settings.max_ai_neighbor_requests} neighbor scripts by providing the ID of a candidate and the edge kind ("requires", "provides_contract", "consumes_contract").
+- You may flag up to 3 script names/paths you expect to exist but are missing from candidates.
+- Return ONLY a JSON object:
+```json
+{{
+    "kept": [
+        {{"id": 1, "reason": "owns DataSaveManager", "confidence": 0.9}}
+    ],
+    "dropped": [
+        {{"id": 5, "reason": "unrelated UI module"}}
+    ],
+    "requested_neighbors": [
+        {{"source_id": 1, "edge_kind": "requires"}}
+    ],
+    "flagged_missing": ["DataRetryHandler", "SaveQueue"]
+}}
+```
+"""
+    if not verbose:
+        console.print(f"[dim]  Phase 2b: AI reviewing {len(script_info)} script candidates...[/dim]")
+
+    gemini_cwd = str(settings.gemini_cli_cwd) if getattr(settings, "gemini_cli_cwd", None) else repo.root_path
+    result = invoke_standalone(prompt, timeout=settings.triage_ai_timeout_secs, cwd=gemini_cwd, no_mcp=True)
+
+    if verbose:
+        _verbose_phase_io(console, "Script Investigator (Phase 2b)", prompt[:3000], result)
+
+    # Build fallback with deterministic provenance
+    all_scripts = {s.id: s for s in session.execute(select(Script).where(Script.repo_id == repo.id)).scalars().all()}
+    fallback_scripts = [
+        SelectedScript(
+            script_id=sid,
+            instance_path=all_scripts[sid].instance_path or all_scripts[sid].file_path if sid in all_scripts else f"script:{sid}",
+            provenance=SelectionProvenance(
+                selected_by="bm25+graph",
+                selection_reason="Deterministic prefilter (BM25 + graph expansion)",
+                confidence=0.7,
+            ),
+        )
+        for sid in prefilter_script_ids
+        if sid in all_scripts
+    ]
+    all_contracts = {c.id: c for c in session.execute(select(Contract)).scalars().all()}
+    fallback_contracts = [
+        SelectedContract(
+            contract_id=cid,
+            contract_name=all_contracts[cid].name if cid in all_contracts else f"contract:{cid}",
+            provenance=SelectionProvenance(
+                selected_by="bm25+graph",
+                selection_reason="Deterministic prefilter",
+                confidence=0.6,
+            ),
+        )
+        for cid in prefilter_contract_ids
+        if cid in all_contracts
+    ]
+
+    if result.exit_code != 0:
+        console.print(f"[dim]  Phase 2b: AI review failed (exit {result.exit_code}), using prefilter.[/dim]")
+        return fallback_scripts, fallback_contracts
+
+    parsed = _try_parse_json(result.stdout.strip() if result.stdout else "")
+    if not parsed or "kept" not in parsed:
+        console.print(f"[dim]  Phase 2b: AI response unparseable, using prefilter.[/dim]")
+        return fallback_scripts, fallback_contracts
+
+    # Process kept scripts
+    kept_ids = set()
+    selected_scripts: list[SelectedScript] = []
+    for entry in parsed.get("kept", []):
+        sid = entry.get("id")
+        if sid not in all_scripts:
+            continue
+        kept_ids.add(sid)
+        selected_scripts.append(SelectedScript(
+            script_id=sid,
+            instance_path=all_scripts[sid].instance_path or all_scripts[sid].file_path,
+            provenance=SelectionProvenance(
+                selected_by="bm25+ai_confirmed",
+                selection_reason=entry.get("reason", "AI confirmed"),
+                confidence=entry.get("confidence", 0.8),
+            ),
+        ))
+
+    # Process neighbor requests (bounded)
+    neighbor_count = 0
+    for req in parsed.get("requested_neighbors", [])[:settings.max_ai_neighbor_requests]:
+        source_id = req.get("source_id")
+        edge_kind = req.get("edge_kind", "requires")
+        if not source_id:
+            continue
+        edges = search_graph(source_id, "script", edge_kind, "outgoing")
+        for e in edges:
+            tid = e.get("target_id")
+            ttype = e.get("target_type", "")
+            if ttype == "script" and tid in all_scripts and tid not in kept_ids:
+                kept_ids.add(tid)
+                neighbor_count += 1
+                selected_scripts.append(SelectedScript(
+                    script_id=tid,
+                    instance_path=all_scripts[tid].instance_path or all_scripts[tid].file_path,
+                    provenance=SelectionProvenance(
+                        selected_by="ai_neighbor_request",
+                        selection_reason=f"Neighbor of script:{source_id} via {edge_kind}",
+                        evidence_refs=[f"edge:{source_id}->{tid}:{edge_kind}"],
+                        confidence=0.6,
+                    ),
+                ))
+
+    # Process flagged-missing scripts (name/path lookup)
+    missing_count = 0
+    for name in parsed.get("flagged_missing", [])[:3]:
+        matches = session.execute(
+            select(Script).where(
+                Script.repo_id == repo.id,
+                Script.instance_path.contains(str(name)),
+            )
+        ).scalars().all()
+        for s in matches[:2]:
+            if s.id not in kept_ids:
+                kept_ids.add(s.id)
+                missing_count += 1
+                selected_scripts.append(SelectedScript(
+                    script_id=s.id,
+                    instance_path=s.instance_path or s.file_path,
+                    provenance=SelectionProvenance(
+                        selected_by="ai_investigator",
+                        selection_reason=f"AI flagged missing: '{name}'",
+                        confidence=0.65,
+                    ),
+                ))
+
+    if not selected_scripts:
+        return fallback_scripts, fallback_contracts
+
+    n_dropped = len(parsed.get("dropped", []))
+    console.print(
+        f"[cyan]Phase 2b: AI Review[/] -> Kept {len(selected_scripts)} scripts"
+        f"{f', +{neighbor_count} neighbors' if neighbor_count else ''}"
+        f"{f', +{missing_count} flagged' if missing_count else ''}"
+        f"{f', dropped {n_dropped}' if n_dropped else ''}."
+    )
+    return selected_scripts, fallback_contracts
 
 
 def _try_parse_json(text: str) -> dict | None:
@@ -664,7 +1053,7 @@ Return a JSON object:
 Return ONLY the JSON.
 """
         gemini_cwd = str(settings.gemini_cli_cwd) if getattr(settings, "gemini_cli_cwd", None) else repo.root_path
-        result = invoke_standalone(prompt, timeout=phase_timeout, cwd=gemini_cwd)
+        result = invoke_standalone(prompt, timeout=phase_timeout, cwd=gemini_cwd, no_mcp=True)
         if verbose:
             _verbose_phase_io(console, "Domain investigator (chunk %s)" % (chunk_id or 0), prompt[:4000], result)
     finally:
@@ -871,36 +1260,56 @@ def _persist_deep_read_memory(
 
 def _validate_environment(task: Task, report: InvestigationReport, session: Session, console):
     """
-    Phase 5: Environment Validation (Agent).
-    Uses MCP to resolve uncertainties.
+    Phase 5: Environment Validation (Code-based).
+    Resolves uncertainties by searching the ingested source code.
     """
+    if not report.uncertainties:
+        console.print(f"[cyan]Phase 5: Environment Validation[/] -> No uncertainties to resolve.")
+        return
+
+    # Build source context from file bodies we already have
+    source_snippets = []
+    for fp, body in report.file_bodies.items():
+        if body:
+            source_snippets.append(f"### {fp}\n```luau\n{body[:3000]}\n```")
+
+    source_context = "\n\n".join(source_snippets[:15])  # Cap to avoid overwhelming
+
     prompt = f"""\
-You are an mcp-validator for a Roblox project.
+You are a code-validator for a Roblox/Luau project.
 
 # Uncertainties flagged by prior investigation:
 {chr(10).join('- ' + u for u in report.uncertainties)}
 
+## Source Code Available
+{source_context}
+
 ## Action
-Use your MCP tools to check the live Studio tree (robloxstudio-mcp) or docs if needed.
+Review the source code above to resolve each uncertainty.
+Search for evidence in the code — look at function calls, variable references,
+RemoteEvent/RemoteFunction usage, module requires, and data flow.
 
 ## Output Format
 Return a JSON object:
 ```json
 {{
-    "facts": ["RemoteEvent 'DashEvent' confirmed exists in ReplicatedStorage.Events"],
-    "unresolved": ["Could not find UI element 'DashBar'"]
+    "facts": ["TeleportData includes lastPosition based on line X in AFK.server.luau"],
+    "unresolved": ["Could not find evidence for Y in available code"]
 }}
 ```
 Return ONLY the JSON.
 """
-    # Allow the standard mcp validation tools
-    console.print(f"[dim]  _validate_environment: checking {len(report.uncertainties)} uncertainties against live Studio...[/dim]")
-    gemini_cwd = str(settings.gemini_cli_cwd) if getattr(settings, "gemini_cli_cwd", None) else None
+    console.print(f"[dim]  _validate_environment: resolving {len(report.uncertainties)} uncertainties from source code...[/dim]")
+
+    from app.models.entities import Repository
+    repo = session.get(Repository, task.repo_id)
+    gemini_cwd = repo.root_path if repo else (str(settings.gemini_cli_cwd) if getattr(settings, "gemini_cli_cwd", None) else None)
+
     result = invoke_standalone(
         prompt,
-        timeout=300,
-        allowed_tools=["list_mcp_servers", "call_mcp_tool"],
+        timeout=45,
         cwd=gemini_cwd,
+        no_mcp=True,
     )
 
     if result.exit_code == 0:
@@ -919,7 +1328,7 @@ Return ONLY the JSON.
             
             report.invariants.extend([f"[ENV FACT] {f}" for f in facts])
             
-            # Persist as environment memory (global scope for now)
+            # Persist as environment memory
             from app.models.entities import MemoryType, MemoryScope
             for f in facts:
                 session.add(MemoryRecord(
@@ -930,7 +1339,7 @@ Return ONLY the JSON.
                 ))
             session.commit()
     else:
-        console.print(f"  [red][mcp-validator] failed.[/red]", style="dim")
+        console.print(f"  [red][code-validator] failed.[/red]", style="dim")
 
 def assemble_from_report(
     task: Task,
@@ -999,9 +1408,23 @@ def assemble_from_report(
                 trimmed_bodies[fp] = body if tokens <= per_file else truncate_to_tokens(body, per_file)
 
         # If the packet assembler threw errors, just fallback to raw lists
+        # but apply a simplicity filter to remove over-engineered suggestions
         if result.exit_code != 0:
             console.print(f"  [red][packet-assembler] failed, falling back to raw lists.[/red]", style="dim")
-            final_invariants = report.invariants
+            _OVERENGINEERING_SIGNALS = [
+                "_G.", "getfenv", "shared.", "rawget",
+                "ReplicatedStorage:FindFirstChild",
+                "pcall(require",
+            ]
+            filtered = []
+            for inv in report.invariants:
+                # Skip invariants that suggest adding lookups for undefined things
+                if any(sig in inv for sig in _OVERENGINEERING_SIGNALS):
+                    continue
+                filtered.append(inv)
+            # Prepend a simplicity reminder
+            filtered.insert(0, "[SIMPLICITY] Prefer removing broken references over adding guards. Use existing local constants.")
+            final_invariants = filtered
             final_risks = report.risks
         else:
             console.print(f"[cyan]Phase 6: Synthesis[/] -> Compiled constraints into final packet.")
@@ -1009,11 +1432,21 @@ def assemble_from_report(
             final_invariants = [f"[SYNTHESIZED CONTEXT]\n{synthesized_text}"]
             final_risks = report.risks # Keep raw risks just in case
 
+        # Build provenance summary for the packet
+        prov_summary = []
+        for sd in report.selected_domains:
+            prov_summary.append({"type": "domain", "name": sd.domain_name, **sd.provenance.model_dump()})
+        for ss in report.selected_scripts:
+            prov_summary.append({"type": "script", "path": ss.instance_path, **ss.provenance.model_dump()})
+        for sc in report.selected_contracts:
+            prov_summary.append({"type": "contract", "name": sc.contract_name, **sc.provenance.model_dump()})
+
         return ContextPacketSchema(
             task_id=task.id,
             objective=task.description,
             target_scope=task.target_scope or "",
             runtime_side=task.runtime_side or "unknown",
+            task_class=task.task_class.value if task.task_class else "",
             relevant_scripts=relevant_scripts,
             relevant_contracts=report.contracts,
             local_invariants=final_invariants,
@@ -1022,6 +1455,7 @@ def assemble_from_report(
             file_bodies=trimmed_bodies,
             token_budget=settings.default_token_budget,
             migration_brief=report.migration_brief,
+            selection_provenance=prov_summary,
         )
     finally:
         session.close()
@@ -1033,9 +1467,12 @@ def run_investigation(
     verbose: bool = False,
 ) -> tuple[ContextPacketSchema, InvestigationReport]:
     """
-    Full hierarchical orchestration loop:
-      1. Triage Domains (Python over MemoryRecords)
-      2. Triage Scripts/Contracts (Python over MemoryRecords)
+    Full hybrid hierarchical orchestration loop:
+      0. Classify task
+      1a. Deterministic Domain Triage (BM25 over MemoryRecords)
+      1b. AI Domain Investigator Review
+      2a. Deterministic Script/Contract Triage (BM25 + graph expansion)
+      2b. AI Script Investigator Review
       3. Docs retrieval (Optional Agent via MCP)
       4. Deep Read (Agent extracts constraints, updates memory)
       5. Environment Validation (Optional Agent via MCP)
@@ -1055,6 +1492,9 @@ def run_investigation(
             raise ValueError(f"Repository {task.repo_id} not found")
 
         task.status = TaskStatus.in_progress
+
+        # Phase 0: Task Classification
+        task.task_class = classify_task(task)
         session.commit()
 
         # Initialize the progressive report
@@ -1066,16 +1506,46 @@ def run_investigation(
         from rich.panel import Panel
         console = Console()
         
-        console.print("\n[dim]-- Hierarchical Investigation Pipeline --[/dim]")
+        console.print("\n[dim]-- Hybrid Investigation Pipeline --[/dim]")
+        console.print(f"[dim]  Task class: [bold]{task.task_class.value}[/bold][/dim]")
 
-        # Phase 1: Domain/Repo Triage
+        import time as _time
+        _pipeline_start = _time.monotonic()
+
+        # Phase 1a: Deterministic Domain Prefilter
+        _t0 = _time.monotonic()
         domain_ids = _triage_domains(task, repo, session)
+        # Build scored list for AI review (reconstruct scores from the triage)
+        scored_domains = [(1.0, did) for did in domain_ids]  # Default score; _triage_domains already sorted
+        _elapsed = _time.monotonic() - _t0
         if domain_ids:
             from app.models.entities import Domain
             d_names = session.execute(select(Domain.name).where(Domain.id.in_(domain_ids))).scalars().all()
-            console.print(f"[cyan]Phase 1: Domain Triage[/] -> {len(domain_ids)} domains selected ({', '.join(d_names)})")
+            console.print(f"[cyan]Phase 1a: Domain Prefilter[/] -> {len(domain_ids)} domains ({', '.join(d_names)}) [dim]⏱ {_elapsed:.1f}s[/dim]")
         else:
-            console.print(f"[cyan]Phase 1: Domain Triage[/] -> No specific domains matched")
+            console.print(f"[cyan]Phase 1a: Domain Prefilter[/] -> No specific domains matched [dim]⏱ {_elapsed:.1f}s[/dim]")
+
+        # Phase 1b: AI Domain Review (skip for small candidate sets — not worth a Gemini call)
+        _t0 = _time.monotonic()
+        _SKIP_AI_DOMAIN_THRESHOLD = 3
+        if domain_ids and len(domain_ids) > _SKIP_AI_DOMAIN_THRESHOLD:
+            report.selected_domains = _ai_review_domains(
+                task, scored_domains, session, repo, console, verbose=verbose,
+            )
+            domain_ids = [sd.domain_id for sd in report.selected_domains]
+            console.print(f"[dim]  ⏱ Phase 1b: {_time.monotonic() - _t0:.1f}s[/dim]")
+        elif domain_ids:
+            console.print(f"[dim]  Phase 1b: skipped (≤{_SKIP_AI_DOMAIN_THRESHOLD} domains) ⏱ 0.0s[/dim]")
+            from app.models.entities import Domain
+            report.selected_domains = [
+                SelectedDomain(
+                    domain_id=did,
+                    domain_name=session.execute(select(Domain.name).where(Domain.id == did)).scalar() or "?",
+                    provenance=SelectionProvenance(selected_by="prefilter", selection_reason="deterministic", confidence=0.8),
+                ) for did in domain_ids
+            ]
+        else:
+            report.selected_domains = []
 
         # Large-change: impact analysis and migration brief before script triage
         if getattr(task, "large_change_mode", 0):
@@ -1094,19 +1564,55 @@ def run_investigation(
             report.migration_brief = brief
             console.print(f"[cyan]  [large-change][/] Impact: {len(report.impact_script_ids)} scripts, {len(report.impact_contract_ids)} contracts; migration brief ready.")
 
-        # Phase 2: Script/Contract Triage (uses impact set in large-change mode; repo_root for pattern-based expansion)
-        report.relevant_script_ids, contract_ids = _triage_scripts(
+        # Phase 2a: Deterministic Script/Contract Triage
+        _t0 = _time.monotonic()
+        prefilter_script_ids, prefilter_contract_ids = _triage_scripts(
             task, domain_ids, session,
             impact_script_ids=report.impact_script_ids or None,
             impact_contract_ids=report.impact_contract_ids or None,
             repo_root=repo.root_path if repo else None,
         )
-        if report.relevant_script_ids:
+        _elapsed = _time.monotonic() - _t0
+        if prefilter_script_ids:
             from app.models.entities import Script
-            s_names = session.execute(select(Script.instance_path).where(Script.id.in_(report.relevant_script_ids))).scalars().all()
-            console.print(f"[cyan]Phase 2: Script Triage[/] -> {len(report.relevant_script_ids)} scripts selected ({', '.join(s_names[:3])}{'...' if len(s_names)>3 else ''})")
+            s_names = session.execute(select(Script.instance_path).where(Script.id.in_(prefilter_script_ids))).scalars().all()
+            console.print(f"[cyan]Phase 2a: Script Prefilter[/] -> {len(prefilter_script_ids)} scripts ({', '.join(s_names[:3])}{'...' if len(s_names)>3 else ''}) [dim]⏱ {_elapsed:.1f}s[/dim]")
         else:
-            console.print(f"[cyan]Phase 2: Script Triage[/] -> No scripts matched")
+            console.print(f"[cyan]Phase 2a: Script Prefilter[/] -> No scripts matched [dim]⏱ {_elapsed:.1f}s[/dim]")
+
+        # Phase 2b: AI Script Review (skip for localized tasks with few candidates)
+        _t0 = _time.monotonic()
+        _SKIP_AI_SCRIPT_THRESHOLD = 3
+        _skip_2b = (
+            task.task_class == TaskClass.semantic_localized
+            and len(prefilter_script_ids) <= _SKIP_AI_SCRIPT_THRESHOLD
+        )
+        if prefilter_script_ids and not _skip_2b:
+            report.selected_scripts, report.selected_contracts = _ai_review_scripts(
+                task, prefilter_script_ids, prefilter_contract_ids,
+                report.selected_domains, session, repo, console, verbose=verbose,
+            )
+            report.relevant_script_ids = [ss.script_id for ss in report.selected_scripts]
+            contract_ids = [sc.contract_id for sc in report.selected_contracts]
+            console.print(f"[dim]  ⏱ Phase 2b: {_time.monotonic() - _t0:.1f}s[/dim]")
+        elif prefilter_script_ids and _skip_2b:
+            console.print(f"[dim]  Phase 2b: skipped (semantic_localized + ≤{_SKIP_AI_SCRIPT_THRESHOLD} scripts) ⏱ 0.0s[/dim]")
+            from app.models.entities import Script
+            report.selected_scripts = [
+                SelectedScript(
+                    script_id=sid,
+                    instance_path=session.execute(select(Script.instance_path).where(Script.id == sid)).scalar() or "?",
+                    provenance=SelectionProvenance(selected_by="prefilter", selection_reason="deterministic", confidence=0.8),
+                ) for sid in prefilter_script_ids
+            ]
+            report.selected_contracts = []
+            report.relevant_script_ids = prefilter_script_ids
+            contract_ids = prefilter_contract_ids
+        else:
+            report.selected_scripts = []
+            report.selected_contracts = []
+            report.relevant_script_ids = prefilter_script_ids
+            contract_ids = prefilter_contract_ids
 
         # Fetch basic contract info for the report
         if contract_ids:
@@ -1120,6 +1626,7 @@ def run_investigation(
             ]
 
         # Phase 3 + 4: Docs and Deep Read in parallel (with per-phase timeout and schema-driven merge)
+        _t0 = _time.monotonic()
         from concurrent.futures import TimeoutError as FuturesTimeoutError
         from concurrent.futures import ThreadPoolExecutor
 
@@ -1177,15 +1684,29 @@ def run_investigation(
                 deep_result.get("new_risk_entries", []),
                 report.relevant_script_ids[0] if report.relevant_script_ids else None,
             )
+        console.print(f"[dim]  ⏱ Phase 3+4 (parallel): {_time.monotonic() - _t0:.1f}s[/dim]")
 
-        # Phase 5: Environment Validation (Agent)
-        if report.uncertainties:
+        # Phase 5: Environment Validation
+        # Skip for semantic_localized (simple fixes don't need uncertainty resolution)
+        # Skip for ≤1 uncertainty (not worth a Gemini call)
+        _t0 = _time.monotonic()
+        _skip_phase5 = (
+            task.task_class == TaskClass.semantic_localized
+            or len(report.uncertainties) <= 1
+        )
+        if not _skip_phase5 and report.uncertainties:
             _validate_environment(task, report, session, console)
+            console.print(f"[dim]  ⏱ Phase 5: {_time.monotonic() - _t0:.1f}s[/dim]")
+        elif report.uncertainties:
+            console.print(f"[dim]  Phase 5: skipped (semantic_localized or ≤1 uncertainty) ⏱ 0.0s[/dim]")
 
         # Phase 6: Synthesis (Packet Assembly)
+        _t0 = _time.monotonic()
         packet = assemble_from_report(task, report, console, verbose=verbose, repo=repo)
+        console.print(f"[dim]  ⏱ Phase 6 (synthesis): {_time.monotonic() - _t0:.1f}s[/dim]")
 
-
+        _total = _time.monotonic() - _pipeline_start
+        console.print(f"[bold dim]  ⏱ Total investigation: {_total:.1f}s[/bold dim]")
 
         # Persist packet
         from app.models.entities import ContextPacket as ContextPacketRow

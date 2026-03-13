@@ -59,6 +59,7 @@ def _run_migrations(engine) -> None:
             ("large_change_mode", "ALTER TABLE tasks ADD COLUMN large_change_mode INTEGER DEFAULT 0"),
             ("revamp_session_id", "ALTER TABLE tasks ADD COLUMN revamp_session_id INTEGER REFERENCES revamp_sessions(id)"),
             ("batch_index", "ALTER TABLE tasks ADD COLUMN batch_index INTEGER"),
+            ("task_class", "ALTER TABLE tasks ADD COLUMN task_class VARCHAR"),
         ]:
             if col not in cols:
                 conn.execute(text(sql))

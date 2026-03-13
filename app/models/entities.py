@@ -93,6 +93,13 @@ class TaskStatus(str, enum.Enum):
     failed = "failed"
 
 
+class TaskClass(str, enum.Enum):
+    semantic_localized = "semantic_localized"
+    cross_cutting = "cross_cutting"
+    migration_refactor = "migration_refactor"
+    runtime_uncertain = "runtime_uncertain"
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 
@@ -280,6 +287,7 @@ class Task(Base):
     status = Column(Enum(TaskStatus), default=TaskStatus.pending)
     target_scope = Column(String, nullable=True)
     runtime_side = Column(String, nullable=True)         # server, client, shared
+    task_class = Column(Enum(TaskClass), nullable=True)  # semantic_localized | cross_cutting | migration_refactor | runtime_uncertain
     large_change_mode = Column(Integer, default=0)        # 0 = no, 1 = yes (impact planning, migration brief, broader retrieval)
     revamp_session_id = Column(Integer, ForeignKey("revamp_sessions.id"), nullable=True)
     batch_index = Column(Integer, nullable=True)          # 1-based batch within revamp (e.g. "introduce transport", "update consumers")

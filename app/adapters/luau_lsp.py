@@ -39,9 +39,12 @@ def run_analyze(
     else:
         cmd.append(str(repo_root))
 
+    import re
     result = subprocess.run(cmd, cwd=str(repo_root), capture_output=True, text=True)
 
     diagnostics: list[dict[str, Any]] = []
+
+    # Strategy 1: Parse stdout as JSON lines (if --formatter=json is used or emits JSON)
     for line in result.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -49,8 +52,24 @@ def run_analyze(
         try:
             diagnostics.append(json.loads(line))
         except json.JSONDecodeError:
-            # luau-lsp may emit non-JSON lines (progress, info)
             pass
+
+    # Strategy 2: Parse stderr text format: file(line,col-col): severity: message
+    _DIAG_PATTERN = re.compile(
+        r"^(.+?)\((\d+),(\d+)(?:-\d+)?\):\s*(Error|Warning|Information)\s*[:\-]\s*(.+)$",
+        re.IGNORECASE,
+    )
+    for line in result.stderr.splitlines():
+        line = line.strip()
+        m = _DIAG_PATTERN.match(line)
+        if m:
+            diagnostics.append({
+                "file": m.group(1).strip(),
+                "line": int(m.group(2)),
+                "col": int(m.group(3)),
+                "severity": m.group(4).capitalize(),
+                "message": m.group(5).strip(),
+            })
 
     return {
         "diagnostics": diagnostics,
