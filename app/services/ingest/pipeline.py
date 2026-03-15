@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select, delete
+
 from app.adapters import rojo
 from app.config import settings
 from app.models.entities import (
@@ -169,15 +171,49 @@ def ingest_repository(repo_path: str | Path) -> RepoSnapshot:
     # 6. Persist
     session = get_session()
     try:
-        repo = Repository(
-            name=repo_root.name,
-            root_path=str(repo_root),
-            rojo_project_path=str(project_path) if project_path else None,
-            sourcemap_path=str(sourcemap_path),
-        )
-        session.add(repo)
-        session.flush()  # get repo.id
+        # Check for existing repo at this path (re-ingest case)
+        existing = session.execute(
+            select(Repository).where(Repository.root_path == str(repo_root))
+        ).scalar_one_or_none()
 
+        if existing:
+            repo = existing
+            repo.rojo_project_path = str(project_path) if project_path else None
+            repo.sourcemap_path = str(sourcemap_path)
+            from datetime import datetime
+            repo.updated_at = datetime.now()
+
+            # Clear old children so we can re-index cleanly
+            old_script_ids = [
+                s.id for s in session.execute(
+                    select(Script.id).where(Script.repo_id == repo.id)
+                ).scalars().all()
+            ]
+            if old_script_ids:
+                session.execute(
+                    delete(GraphEdge).where(
+                        GraphEdge.source_id.in_(old_script_ids),
+                        GraphEdge.source_type == "script",
+                    )
+                )
+            session.execute(
+                delete(Script).where(Script.repo_id == repo.id)
+            )
+            session.execute(
+                delete(Domain).where(Domain.repo_id == repo.id)
+            )
+            session.flush()
+        else:
+            repo = Repository(
+                name=repo_root.name,
+                root_path=str(repo_root),
+                rojo_project_path=str(project_path) if project_path else None,
+                sourcemap_path=str(sourcemap_path),
+            )
+            session.add(repo)
+            session.flush()  # get repo.id
+
+        # Re-index domains, scripts, and edges
         domain_id_map: dict[str, int] = {}
         for di in domain_infos:
             kind = DomainKind(di.kind) if di.kind in DomainKind.__members__ else DomainKind.shared
