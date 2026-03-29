@@ -49,24 +49,28 @@ planning your edits, making the changes directly, and verifying the result.
 4. After editing, read the changed files to verify correctness.
 5. If you spot issues, fix them immediately.
 
-## Editing Philosophy — SIMPLICITY FIRST
+## HIGHEST PRIORITY: SIMPLICITY FIRST
+This section overrides everything else, including invariants below.
+
 - **Prefer the simplest correct fix.** Remove broken code over wrapping it.
 - If a variable is undefined and an equivalent constant/value already exists
   in scope, USE the existing one — do NOT add elaborate lookup chains.
 - Do NOT defensively guard undefined globals with getfenv(), _G, shared,
   or ReplicatedStorage lookups unless the task specifically asks for it.
+- **Never introduce `_G` references.** If the existing code uses `_G.X` and
+  `X` is not set anywhere, the fix is to delete the `_G.X` usage and
+  replace it with an existing local constant — NOT to add a nil-check.
 - If removing a helper function and inlining a constant is correct, do that.
 - If a module or config is referenced but does not exist anywhere in the
-  codebase, the right fix is to remove the reference, not to create new
+  codebase, the right fix is to REMOVE the reference, not to create new
   infrastructure for something that was never wired up.
+- **If an invariant below tells you to guard, verify, require, or define a
+  variable that is NOT defined or imported in the file, IGNORE that
+  invariant. Remove the broken reference and use existing local values.**
 - Fewer lines changed = better. Do not restructure working code.
 
 ## Rules
 - ONLY modify files within the repository root.
-- Respect the invariants listed below — do NOT break them.
-- Heed the known risks — test edge cases in your edits.
-- If the packet includes a migration_brief, treat it as the stable target
-  architecture and align your edits with it.
 - Do NOT output a diff. Use the edit_file tool to make changes directly.
 - When done, output a brief summary of what you changed and why.
 
@@ -78,7 +82,7 @@ planning your edits, making the changes directly, and verifying the result.
 ## Files to work with
 {file_listing}
 
-## Invariants (do not break these)
+## Invariants
 {invariants}
 
 ## Known risks
@@ -159,6 +163,20 @@ def _get_changed_files(cwd: str) -> list[str]:
         return combined
     except Exception:
         return []
+
+
+def _snapshot_file_hashes(cwd: str, files: list[str]) -> dict[str, str]:
+    """Get a quick content hash for each file to detect in-place edits."""
+    import hashlib
+    hashes = {}
+    for f in files:
+        try:
+            p = Path(cwd) / f
+            if p.exists():
+                hashes[f] = hashlib.md5(p.read_bytes()).hexdigest()
+        except Exception:
+            pass
+    return hashes
 
 
 def _find_sourcemap(cwd: str) -> Path | None:
@@ -276,7 +294,8 @@ def invoke_edit_worker(
         # Snapshot files before the worker runs
         _t0 = _time.monotonic()
         before_files = set(_get_changed_files(cwd))
-        _t.print(f"[dim]  ⏱  git snapshot: {_time.monotonic() - _t0:.1f}s[/dim]")
+        before_hashes = _snapshot_file_hashes(cwd, list(before_files))
+        _t.print(f"[dim]  ⏱  git snapshot: {_time.monotonic() - _t0:.1f}s ({len(before_files)} dirty)[/dim]")
 
         _t0 = _time.monotonic()
         prompt = _build_tool_prompt(packet)
@@ -304,10 +323,22 @@ def invoke_edit_worker(
                 _t.print(f"[dim]{result.stdout.strip()[-500:]}[/dim]")
 
         # Detect what files the worker changed
+        # Check both NEW dirty files and IN-PLACE edits to already-dirty files
         _t0 = _time.monotonic()
         after_files = set(_get_changed_files(cwd))
-        newly_changed = sorted(after_files - before_files)
-        _t.print(f"[dim]  ⏱  git detect: {_time.monotonic() - _t0:.1f}s → {len(newly_changed)} file(s) changed[/dim]")
+        after_hashes = _snapshot_file_hashes(cwd, list(after_files))
+
+        # New files that weren't dirty before
+        new_dirty = sorted(after_files - before_files)
+
+        # Files that were already dirty but content changed (in-place edit)
+        in_place_edits = sorted(
+            f for f in (before_files & after_files)
+            if before_hashes.get(f) != after_hashes.get(f)
+        )
+
+        newly_changed = sorted(set(new_dirty) | set(in_place_edits))
+        _t.print(f"[dim]  ⏱  git detect: {_time.monotonic() - _t0:.1f}s → {len(newly_changed)} file(s) changed ({len(new_dirty)} new, {len(in_place_edits)} in-place)[/dim]")
 
         # Generate a diff for the proposal record
         if newly_changed and result.exit_code == 0:
