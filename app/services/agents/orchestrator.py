@@ -428,14 +428,14 @@ def _content_patterns_for_task(description: str) -> list[str] | None:
             "replication",
             "value object",
             "stat sync",
-            "privatestats",
+            "clientstatstore",
             "getstat",
             "buffer-compressed",
             "physics recv",
         )
     ):
         return None
-    return ["GetStat", "PrivateStats", ".Value", "ValueObject", "stat", "replicat"]
+    return ["GetStat", "ClientStatStore", ".Value", "ValueObject", "stat", "replicat"]
 
 
 def _script_ids_matching_content(

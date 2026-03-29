@@ -52,12 +52,12 @@ def truncate_to_tokens(text: str, max_tokens: int, suffix: str = "\n... (truncat
 
 
 def _gather_1hop_deps(script_id: int, session) -> list[int]:
-    """Return script IDs that are 1-hop require neighbours."""
+    """Return script IDs that are 1-hop require neighbours or dependencies."""
     edges = session.execute(
         select(GraphEdge).where(
             GraphEdge.source_id == script_id,
             GraphEdge.source_type == "script",
-            GraphEdge.edge_kind == EdgeKind.requires,
+            GraphEdge.edge_kind.in_([EdgeKind.requires, EdgeKind.references, EdgeKind.depends_on]),
         )
     ).scalars().all()
     return [e.target_id for e in edges]
@@ -92,7 +92,11 @@ def assemble_packet(
                 session.execute(
                     select(Script).where(
                         Script.repo_id == task.repo_id,
-                        or_(*(Script.instance_path.contains(s) for s in scopes)),
+                        or_(
+                            *(Script.instance_path.contains(s) for s in scopes),
+                            *(Script.file_path.contains(s) for s in scopes),
+                            *(Script.summary.contains(s) for s in scopes)
+                        ),
                     )
                 ).scalars().all()
             )

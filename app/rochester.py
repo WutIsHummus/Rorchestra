@@ -34,7 +34,33 @@ from rich.columns import Columns
 from rich.rule import Rule
 from rich import box
 
-console = Console()
+# Force UTF-8 so Unicode logo/emoji render on Windows regardless of code page
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+class _ResizableConsole(Console):
+    """Console that re-reads terminal width on every render (handles resize)."""
+
+    @property
+    def width(self) -> int:                     # type: ignore[override]
+        return shutil.get_terminal_size().columns
+
+    @width.setter
+    def width(self, value: int) -> None:
+        pass  # ignore Rich's cached width
+
+console = _ResizableConsole(force_terminal=True)
 
 # ── Session-level active repo ────────────────────────────────────────────
 
@@ -1088,8 +1114,9 @@ You are a Roblox/Luau codebase expert. Answer concisely.
 {question}
 """
 
+    from app.config import settings as _cfg
     with console.status(f"  [{P1}]💭 Thinking...[/]", spinner="dots"):
-        result = invoke_standalone(prompt, timeout=120, cwd=repo.root_path)
+        result = invoke_standalone(prompt, timeout=_cfg.worker_timeout_secs, cwd=repo.root_path)
 
     _print_token_line(result)
 
@@ -1346,9 +1373,60 @@ def handle_mcp(args: str):
     console.print()
 
 
+# ── Intent classification ────────────────────────────────────────────────
+
+_EDIT_SIGNALS = {
+    "fix", "change", "update", "refactor", "rename", "replace", "remove",
+    "delete", "add", "create", "implement", "modify", "rewrite", "migrate",
+    "move", "extract", "convert", "make", "ensure", "set", "use", "swap",
+    "integrate", "wire", "hook", "connect", "disconnect", "enable", "disable",
+}
+
+_ASK_SIGNALS = {
+    "what", "how", "why", "where", "when", "which", "is", "are", "does",
+    "do", "can", "could", "would", "should", "explain", "describe", "show",
+    "list", "tell", "who",
+}
+
+
+def _looks_like_edit(text: str) -> bool:
+    """Fast intent classifier — does this look like a code change request?"""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    first_word = stripped.split()[0].lower()
+    # Starts with an edit verb → almost certainly an edit
+    if first_word in _EDIT_SIGNALS:
+        return True
+    # Contains a question mark or starts with a question word → ask
+    if "?" in text or first_word in _ASK_SIGNALS:
+        return False
+    # Contains edit verbs anywhere → lean towards edit
+    words = set(stripped.lower().split())
+    if words & _EDIT_SIGNALS:
+        return True
+    # Problem statements ("doesn't work", "isn't updating") → likely a fix request
+    lowered = stripped.lower()
+    _PROBLEM_PATTERNS = (
+        "doesn't", "doesnt", "don't", "dont",
+        "isn't", "isnt", "aren't", "arent",
+        "won't", "wont", "can't", "cant",
+        "not working", "not updating", "not showing",
+        "broken", "stuck", "missing", "failed",
+        "get updated", "gets updated",
+    )
+    if any(p in lowered for p in _PROBLEM_PATTERNS):
+        return True
+    return False
+
+
 def handle_natural_language(text: str):
-    """Handle natural language — route to /ask."""
-    handle_ask(text)
+    """Route natural language to /edit or /ask based on intent."""
+    if _looks_like_edit(text):
+        _dim("Detected edit intent")
+        handle_edit(text)
+    else:
+        handle_ask(text)
 
 
 def handle_plans(args: str):
